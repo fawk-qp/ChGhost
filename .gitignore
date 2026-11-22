@@ -1,0 +1,14 @@
+bin/
+obj/
+Release_Build/
+_backup/
+*.bak
+*.zip
+.vs/
+
+board_auto_v4.json
+board_auto_v5.json
+board_auto_v6.json
+board_auto_v7.json
+board_auto_v8.json
+board_config_v4.json
