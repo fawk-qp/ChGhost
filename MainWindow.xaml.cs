@@ -23,8 +23,10 @@ namespace ChGhost
     public class PieceTemplate
     {
         public double[] EdgePatch { get; set; } = Array.Empty<double>();
+        public double[] MaskPatch { get; set; } = Array.Empty<double>();
         public double PieceLuma { get; set; }
         public double RawContrast { get; set; }
+        public int ForegroundPixels { get; set; }
         public bool IsWhite { get; set; }
     }
 
@@ -34,6 +36,7 @@ namespace ChGhost
         public int TopLeftY { get; set; }
         public int BottomRightX { get; set; }
         public int BottomRightY { get; set; }
+        public double WhiteBlackThreshold { get; set; } = 150.0;
         public Dictionary<char, List<PieceTemplate>> Signatures { get; set; } = new();
     }
 
@@ -77,9 +80,10 @@ namespace ChGhost
         private static readonly int ENGINE_THREADS = Math.Max(4, Environment.ProcessorCount - 2);
         private const int ENGINE_HASH_MB = 512;
 
-        private const string DB_FILE = "board_auto_v9.json";
-        private const string LEGACY_DB_FILE = "board_auto_v8.json";
+        private const string DB_FILE = "board_auto_v10.json";
+        private const string LEGACY_V9_FILE = "board_auto_v9.json";
         private const int PATCH_SIZE = 32;
+        private static readonly char[] PieceTypesUpper = { 'P', 'N', 'B', 'R', 'Q', 'K' };
 
         private readonly (char fen, string name)[] _manualFixOrder =
         {
@@ -91,6 +95,7 @@ namespace ChGhost
         private int _fixIndex = 0;
 
         private Dictionary<char, List<PieceTemplate>> _pieceSignatures = new();
+        private double _whiteBlackThreshold = 150.0;
 
         private Point _topLeft = Point.Empty;
         private Point _bottomRight = Point.Empty;
@@ -112,8 +117,6 @@ namespace ChGhost
         private string _lastMoveRussianText = "";
         private bool _lastMoveIsCastling = false;
         private string _debugInfo = "";
-
-        private readonly HashSet<string> _seenPositions = new();
 
         private char[,]? _confirmedGrid = null;
         private char[,]? _currentGrid = null;
@@ -186,7 +189,7 @@ namespace ChGhost
                         _bottomRight = cursor;
                         SaveConfig();
                         DrawCalibrationGrid();
-                        UpdateUI("Углы заданы! Нажмите Alt+3 (авто-определение позиции и старт).");
+                        UpdateUI("Углы заданы! Нажмите Alt+3 на старте партии (1 раз) для калибровки.");
                         break;
 
                     case 3:
@@ -208,7 +211,7 @@ namespace ChGhost
 
                     case 7:
                         _playAsBlack = !_playAsBlack;
-                        ResetBoardTracking(clearHistory: true);
+                        ResetBoardTracking();
                         RedrawOverlay();
                         UpdateUI();
                         break;
@@ -223,7 +226,7 @@ namespace ChGhost
                         break;
 
                     case 10:
-                        ResetBoardTracking(clearHistory: false);
+                        ResetBoardTracking();
                         RedrawOverlay();
                         _ = ScanAndSuggestAsync(forceCalculate: true);
                         break;
@@ -257,14 +260,38 @@ namespace ChGhost
             return IntPtr.Zero;
         }
 
+        private bool HasValidBoardBounds()
+        {
+            return _topLeft != Point.Empty
+                && _bottomRight != Point.Empty
+                && (_bottomRight.X - _topLeft.X) >= 120
+                && (_bottomRight.Y - _topLeft.Y) >= 120;
+        }
+
+        private bool HasValidSignatures()
+        {
+            if (_pieceSignatures.Count < 12) return false;
+            foreach (var kv in _pieceSignatures)
+            {
+                if (kv.Value == null || kv.Value.Count == 0) return false;
+                if (kv.Value.Any(t => t.EdgePatch.Length != PATCH_SIZE * PATCH_SIZE || t.MaskPatch.Length != PATCH_SIZE * PATCH_SIZE))
+                    return false;
+            }
+            return true;
+        }
+
         private void SmartAlt3Action()
         {
-            if (_topLeft == Point.Empty || _bottomRight == Point.Empty)
+            if (!HasValidBoardBounds())
             {
                 UpdateUI("Сначала задайте углы доски: Alt+1 (верх-лево) и Alt+2 (низ-право)!");
                 return;
             }
 
+            if (!HasValidSignatures())
+                LoadConfig();
+
+            bool playAsBlackSnap = _playAsBlack;
             using Bitmap boardBmp = CaptureBoard();
             int backRanksOccupied = 0;
             int centerOccupied = 0;
@@ -277,7 +304,7 @@ namespace ChGhost
                     var tpl = ExtractPieceTemplate32x32(boardBmp, r, c);
                     templatesGrid[r, c] = tpl;
 
-                    bool hasPiece = tpl.RawContrast >= 18.0;
+                    bool hasPiece = IsCellOccupied(tpl);
                     if (r == 0 || r == 1 || r == 6 || r == 7)
                     {
                         if (hasPiece) backRanksOccupied++;
@@ -289,8 +316,7 @@ namespace ChGhost
                 }
             }
 
-            bool isStartingLayout = (_pieceSignatures.Count < 12 && backRanksOccupied >= 20)
-                                    || (backRanksOccupied >= 24 && centerOccupied <= 3);
+            bool isStartingLayout = (backRanksOccupied >= 26 && centerOccupied <= 2);
 
             if (isStartingLayout)
             {
@@ -307,27 +333,46 @@ namespace ChGhost
                 };
 
                 _pieceSignatures.Clear();
+                var whiteLumas = new List<double>();
+                var blackLumas = new List<double>();
+                var seenSquareParity = new HashSet<(char piece, int parity)>();
+
                 for (int r = 0; r < 8; r++)
                 {
                     for (int c = 0; c < 8; c++)
                     {
-                        int boardR = _playAsBlack ? 7 - r : r;
-                        int boardC = _playAsBlack ? 7 - c : c;
+                        int boardR = playAsBlackSnap ? 7 - r : r;
+                        int boardC = playAsBlackSnap ? 7 - c : c;
                         char piece = startRows[boardR][boardC];
                         if (piece == '.') continue;
 
                         var tpl = templatesGrid[r, c];
-                        tpl.IsWhite = char.IsUpper(piece);
+                        bool isWhitePiece = char.IsUpper(piece);
+                        tpl.IsWhite = isWhitePiece;
 
+                        if (isWhitePiece) whiteLumas.Add(tpl.PieceLuma);
+                        else blackLumas.Add(tpl.PieceLuma);
+
+                        int parity = (r + c) & 1;
                         if (!_pieceSignatures.ContainsKey(piece))
                             _pieceSignatures[piece] = new List<PieceTemplate>();
 
-                        _pieceSignatures[piece].Add(tpl);
+                        if (seenSquareParity.Add((piece, parity)) || _pieceSignatures[piece].Count < 2)
+                            _pieceSignatures[piece].Add(tpl);
                     }
                 }
 
+                if (whiteLumas.Count > 0 && blackLumas.Count > 0)
+                {
+                    whiteLumas.Sort();
+                    blackLumas.Sort();
+                    double medianWhite = whiteLumas[whiteLumas.Count / 2];
+                    double medianBlack = blackLumas[blackLumas.Count / 2];
+                    _whiteBlackThreshold = (medianWhite + medianBlack) * 0.5;
+                }
+
                 SaveConfig();
-                ResetBoardTracking(clearHistory: true);
+                ResetBoardTracking();
                 SendUciNewGame();
                 ClearGraphics();
 
@@ -337,32 +382,33 @@ namespace ChGhost
                     _scanTimer.Start();
                 }
 
-                UpdateUI($"СТАРТ распознан (края={backRanksOccupied}/32) -> Считаю ход...");
+                UpdateUI($"Эталоны v10 сняты со старта (порог={_whiteBlackThreshold:F0}) -> Считаю ход...");
                 _ = ScanAndSuggestAsync(forceCalculate: true);
+                return;
             }
-            else
+
+            if (!HasValidSignatures())
             {
-                if (_pieceSignatures.Count < 12)
-                {
-                    UpdateUI($"Не вижу стартовой расстановки (края={backRanksOccupied}, центр={centerOccupied}). Проверьте углы Alt+1/Alt+2!");
-                    return;
-                }
-
-                ResetBoardTracking(clearHistory: false);
-                if (!_isRunning)
-                {
-                    _isRunning = true;
-                    _scanTimer.Start();
-                }
-
-                UpdateUI("Синхронизация позиции -> считаю твой ход...");
-                _ = ScanAndSuggestAsync(forceCalculate: true);
+                UpdateUI($"Нет базы эталонов v10 (края={backRanksOccupied}, центр={centerOccupied}). Нажмите 1 раз Alt+3 на стартовой доске!");
+                return;
             }
+
+            ResetBoardTracking();
+            ClearGraphics();
+
+            if (!_isRunning)
+            {
+                _isRunning = true;
+                _scanTimer.Start();
+            }
+
+            UpdateUI("Полный пересчёт позиции с чистого листа -> считаю ход...");
+            _ = ScanAndSuggestAsync(forceCalculate: true);
         }
 
         private void ManualFixPieceAtCursor(Point cursor)
         {
-            if (_topLeft == Point.Empty || _bottomRight == Point.Empty)
+            if (!HasValidBoardBounds())
             {
                 UpdateUI("Сначала задайте углы доски (Alt+1 и Alt+2)!");
                 return;
@@ -391,27 +437,51 @@ namespace ChGhost
                 _pieceSignatures[targetFen] = new List<PieceTemplate>();
 
             _pieceSignatures[targetFen].Add(tpl);
-            if (_pieceSignatures[targetFen].Count > 2)
+            if (_pieceSignatures[targetFen].Count > 3)
                 _pieceSignatures[targetFen].RemoveAt(0);
 
+            RecalculateWhiteBlackThreshold();
             SaveConfig();
 
             _fixIndex = (_fixIndex + 1) % _manualFixOrder.Length;
 
-            if (_pieceSignatures.Count < 12)
+            if (!HasValidSignatures())
             {
                 UpdateUI($"Записано: [{savedName}] ({_pieceSignatures.Count}/12). Далее: [{_manualFixOrder[_fixIndex].name}] -> Alt+F");
             }
             else
             {
-                ResetBoardTracking(clearHistory: false);
+                ResetBoardTracking();
                 UpdateUI($"Обновлено: [{savedName}]! Далее: [{_manualFixOrder[_fixIndex].name}]");
                 if (_isRunning)
                     _ = ScanAndSuggestAsync(forceCalculate: true);
             }
         }
 
-        private void ResetBoardTracking(bool clearHistory = false)
+        private void RecalculateWhiteBlackThreshold()
+        {
+            var whiteLumas = new List<double>();
+            var blackLumas = new List<double>();
+
+            foreach (var kv in _pieceSignatures)
+            {
+                bool isWhite = char.IsUpper(kv.Key);
+                foreach (var t in kv.Value)
+                {
+                    if (isWhite) whiteLumas.Add(t.PieceLuma);
+                    else blackLumas.Add(t.PieceLuma);
+                }
+            }
+
+            if (whiteLumas.Count > 0 && blackLumas.Count > 0)
+            {
+                whiteLumas.Sort();
+                blackLumas.Sort();
+                _whiteBlackThreshold = (whiteLumas[whiteLumas.Count / 2] + blackLumas[blackLumas.Count / 2]) * 0.5;
+            }
+        }
+
+        private void ResetBoardTracking()
         {
             _lastStableFen = "";
             _lastRawFen = "";
@@ -421,8 +491,6 @@ namespace ChGhost
             _debugInfo = "";
             _confirmedGrid = null;
             _currentGrid = null;
-            if (clearHistory)
-                _seenPositions.Clear();
         }
 
         private static string GetRussianPieceShort(char fenPiece) => char.ToUpper(fenPiece) switch
@@ -453,6 +521,8 @@ namespace ChGhost
             {
                 if (_stockfish != null && !_stockfish.HasExited) return true;
 
+                KillStockfish();
+
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
                 string exePath = System.IO.Path.Combine(baseDir, "stockfish.exe");
 
@@ -462,9 +532,10 @@ namespace ChGhost
                     return false;
                 }
 
+                Process? candidate = null;
                 try
                 {
-                    _stockfish = new Process
+                    candidate = new Process
                     {
                         StartInfo = new ProcessStartInfo
                         {
@@ -473,12 +544,11 @@ namespace ChGhost
                             UseShellExecute = false,
                             RedirectStandardInput = true,
                             RedirectStandardOutput = true,
-                            RedirectStandardError = true,
                             CreateNoWindow = true
                         }
                     };
 
-                    _stockfish.OutputDataReceived += (_, args) =>
+                    candidate.OutputDataReceived += (_, args) =>
                     {
                         if (string.IsNullOrEmpty(args.Data)) return;
                         var waiter = _sfWaiter;
@@ -488,45 +558,47 @@ namespace ChGhost
                         }
                     };
 
-                    _stockfish.Start();
-                    _stockfish.BeginOutputReadLine();
-                    _stockfish.StandardInput.AutoFlush = true;
+                    candidate.Start();
+                    candidate.BeginOutputReadLine();
+                    candidate.StandardInput.AutoFlush = true;
 
                     _sfExpectedPrefix = "readyok";
                     _sfWaiter = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-                    _stockfish.StandardInput.WriteLine("uci");
-                    _stockfish.StandardInput.WriteLine($"setoption name Threads value {ENGINE_THREADS}");
-                    _stockfish.StandardInput.WriteLine($"setoption name Hash value {ENGINE_HASH_MB}");
-                    _stockfish.StandardInput.WriteLine("setoption name MultiPV value 1");
-                    _stockfish.StandardInput.WriteLine("setoption name Move Overhead value 15");
+                    candidate.StandardInput.WriteLine("uci");
+                    candidate.StandardInput.WriteLine($"setoption name Threads value {ENGINE_THREADS}");
+                    candidate.StandardInput.WriteLine($"setoption name Hash value {ENGINE_HASH_MB}");
+                    candidate.StandardInput.WriteLine("setoption name MultiPV value 1");
+                    candidate.StandardInput.WriteLine("setoption name Move Overhead value 15");
 
                     if (_fullStrength)
                     {
-                        _stockfish.StandardInput.WriteLine("setoption name UCI_LimitStrength value false");
+                        candidate.StandardInput.WriteLine("setoption name UCI_LimitStrength value false");
                     }
                     else
                     {
-                        _stockfish.StandardInput.WriteLine("setoption name UCI_LimitStrength value true");
-                        _stockfish.StandardInput.WriteLine($"setoption name UCI_Elo value {TARGET_ELO}");
+                        candidate.StandardInput.WriteLine("setoption name UCI_LimitStrength value true");
+                        candidate.StandardInput.WriteLine($"setoption name UCI_Elo value {TARGET_ELO}");
                     }
 
-                    _stockfish.StandardInput.WriteLine("ucinewgame");
-                    _stockfish.StandardInput.WriteLine("isready");
+                    candidate.StandardInput.WriteLine("ucinewgame");
+                    candidate.StandardInput.WriteLine("isready");
 
                     if (_sfWaiter.Task.Wait(3500))
                     {
                         _sfExpectedPrefix = "";
+                        _stockfish = candidate;
                         return true;
                     }
 
                     _debugInfo = "Stockfish не ответил readyok.";
-                    KillStockfish();
+                    DisposeProcessSafely(candidate);
                     return false;
                 }
                 catch (Exception ex)
                 {
                     _debugInfo = $"Ошибка запуска: {ex.Message}";
+                    DisposeProcessSafely(candidate);
                     return false;
                 }
             }
@@ -553,13 +625,28 @@ namespace ChGhost
             {
                 _sfExpectedPrefix = "";
                 _sfWaiter?.TrySetCanceled();
-                try
-                {
-                    if (_stockfish != null && !_stockfish.HasExited)
-                        _stockfish.Kill();
-                }
-                catch { }
+                _sfWaiter = null;
+                DisposeProcessSafely(_stockfish);
                 _stockfish = null;
+            }
+        }
+
+        private static void DisposeProcessSafely(Process? proc)
+        {
+            if (proc == null) return;
+            try
+            {
+                if (!proc.HasExited)
+                {
+                    try { proc.StandardInput.Close(); } catch { }
+                    proc.Kill();
+                    proc.WaitForExit(1000);
+                }
+            }
+            catch { }
+            finally
+            {
+                try { proc.Dispose(); } catch { }
             }
         }
 
@@ -581,26 +668,26 @@ namespace ChGhost
                 return;
             }
 
-            if (_topLeft == Point.Empty || _bottomRight == Point.Empty)
+            if (!HasValidBoardBounds())
             {
                 StatusText.Text = "1. Угол A8 -> Alt+1 | 2. Угол H1 -> Alt+2";
                 return;
             }
 
-            if (_pieceSignatures.Count < 12)
+            if (!HasValidSignatures())
             {
-                StatusText.Text = $"Нажмите Alt+3 на старте (авто) ИЛИ вручную ({_pieceSignatures.Count}/12): [{_manualFixOrder[_fixIndex].name}] -> Alt+F";
+                StatusText.Text = $"Откройте старт партии и нажмите 1 раз Alt+3 (или вручную: [{_manualFixOrder[_fixIndex].name}] -> Alt+F)";
                 return;
             }
 
             if (_isRunning)
             {
                 if (!string.IsNullOrEmpty(_lastMoveRussianText))
-                    StatusText.Text = $"ТВОЙ ХОД: {_lastMoveRussianText} | Alt+B: режим скорости | Alt+3: обновить";
+                    StatusText.Text = $"ТВОЙ ХОД: {_lastMoveRussianText} | Alt+3: пересчитать | Alt+B: скорость";
                 else if (!string.IsNullOrEmpty(_debugInfo))
                     StatusText.Text = _debugInfo;
                 else
-                    StatusText.Text = "Жду хода соперника... (Alt+3: синхронизация | Alt+B: блиц/рапид)";
+                    StatusText.Text = "Жду хода соперника... (Alt+3: пересчитать заново | Alt+B: блиц/рапид)";
             }
             else
             {
@@ -613,10 +700,11 @@ namespace ChGhost
             _isRunning = false;
             _scanTimer.Stop();
             _pieceSignatures.Clear();
+            _whiteBlackThreshold = 150.0;
             _fixIndex = 0;
             _topLeft = Point.Empty;
             _bottomRight = Point.Empty;
-            ResetBoardTracking(clearHistory: true);
+            ResetBoardTracking();
 
             string cfgPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, DB_FILE);
             if (File.Exists(cfgPath)) File.Delete(cfgPath);
@@ -633,6 +721,7 @@ namespace ChGhost
                 TopLeftY = _topLeft.Y,
                 BottomRightX = _bottomRight.X,
                 BottomRightY = _bottomRight.Y,
+                WhiteBlackThreshold = _whiteBlackThreshold,
                 Signatures = _pieceSignatures
             };
             File.WriteAllText(cfgPath, JsonSerializer.Serialize(cfg));
@@ -641,37 +730,71 @@ namespace ChGhost
         private void LoadConfig()
         {
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            string cfgPath = System.IO.Path.Combine(baseDir, DB_FILE);
-            string legacyPath = System.IO.Path.Combine(baseDir, LEGACY_DB_FILE);
+            string curDir = Directory.GetCurrentDirectory();
 
-            string pathToRead = File.Exists(cfgPath) ? cfgPath : (File.Exists(legacyPath) ? legacyPath : "");
-            if (string.IsNullOrEmpty(pathToRead)) return;
-
-            try
+            string[] v10Candidates =
             {
-                var cfg = JsonSerializer.Deserialize<SavedConfig>(File.ReadAllText(pathToRead));
-                if (cfg != null)
+                System.IO.Path.Combine(baseDir, DB_FILE),
+                System.IO.Path.Combine(curDir, DB_FILE),
+                System.IO.Path.Combine(curDir, "Release_Build", DB_FILE),
+                System.IO.Path.Combine(curDir, "ChGhost_v1.0_Win64", DB_FILE)
+            };
+
+            string? v10Path = v10Candidates.FirstOrDefault(File.Exists);
+            if (!string.IsNullOrEmpty(v10Path))
+            {
+                try
                 {
-                    _topLeft = new Point(cfg.TopLeftX, cfg.TopLeftY);
-                    _bottomRight = new Point(cfg.BottomRightX, cfg.BottomRightY);
-                    _pieceSignatures = cfg.Signatures ?? new();
+                    var cfg = JsonSerializer.Deserialize<SavedConfig>(File.ReadAllText(v10Path));
+                    if (cfg != null)
+                    {
+                        _topLeft = new Point(cfg.TopLeftX, cfg.TopLeftY);
+                        _bottomRight = new Point(cfg.BottomRightX, cfg.BottomRightY);
+                        _whiteBlackThreshold = cfg.WhiteBlackThreshold > 50.0 ? cfg.WhiteBlackThreshold : 150.0;
+                        _pieceSignatures = cfg.Signatures ?? new();
+                        if (HasValidSignatures())
+                            return;
+                    }
                 }
+                catch { }
             }
-            catch { }
+
+            string[] legacyCandidates =
+            {
+                System.IO.Path.Combine(baseDir, LEGACY_V9_FILE),
+                System.IO.Path.Combine(curDir, LEGACY_V9_FILE),
+                System.IO.Path.Combine(curDir, "Release_Build", LEGACY_V9_FILE),
+                System.IO.Path.Combine(curDir, "ChGhost_v1.0_Win64", LEGACY_V9_FILE)
+            };
+
+            string? legacyPath = legacyCandidates.FirstOrDefault(File.Exists);
+            if (!string.IsNullOrEmpty(legacyPath))
+            {
+                try
+                {
+                    var legacyCfg = JsonSerializer.Deserialize<SavedConfig>(File.ReadAllText(legacyPath));
+                    if (legacyCfg != null && _topLeft == Point.Empty && _bottomRight == Point.Empty)
+                    {
+                        _topLeft = new Point(legacyCfg.TopLeftX, legacyCfg.TopLeftY);
+                        _bottomRight = new Point(legacyCfg.BottomRightX, legacyCfg.BottomRightY);
+                    }
+                }
+                catch { }
+            }
         }
 
         private void ToggleEngine()
         {
-            if (_topLeft == Point.Empty || _bottomRight == Point.Empty || _pieceSignatures.Count < 12)
+            if (!HasValidBoardBounds() || !HasValidSignatures())
             {
-                UpdateUI("Сначала задайте углы (Alt+1, Alt+2) и нажмите Alt+3!");
+                UpdateUI("Сначала задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте партии!");
                 return;
             }
 
             _isRunning = !_isRunning;
             if (_isRunning)
             {
-                ResetBoardTracking(clearHistory: false);
+                ResetBoardTracking();
                 ClearGraphics();
                 _scanTimer.Start();
                 _ = ScanAndSuggestAsync(forceCalculate: true);
@@ -687,8 +810,7 @@ namespace ChGhost
         private void DrawCalibrationGrid()
         {
             ClearGraphics();
-            if (_topLeft == Point.Empty || _bottomRight == Point.Empty) return;
-            if (_bottomRight.X <= _topLeft.X || _bottomRight.Y <= _topLeft.Y) return;
+            if (!HasValidBoardBounds()) return;
 
             var source = PresentationSource.FromVisual(this);
             double dpiX = source?.CompositionTarget?.TransformFromDevice.M11 ?? 1.0;
@@ -739,6 +861,11 @@ namespace ChGhost
             return bmp;
         }
 
+        private static bool IsCellOccupied(PieceTemplate tpl)
+        {
+            return tpl.ForegroundPixels >= 75 && tpl.RawContrast >= 12.0;
+        }
+
         private PieceTemplate ExtractPieceTemplate32x32(Bitmap board, int row, int col)
         {
             double cellW = board.Width / 8.0;
@@ -747,19 +874,10 @@ namespace ChGhost
             int x0 = (int)(col * cellW);
             int y0 = (int)(row * cellH);
 
-            Color[] bgSamples =
-            {
-                board.GetPixel(x0 + (int)(cellW * 0.88), y0 + (int)(cellH * 0.12)),
-                board.GetPixel(x0 + (int)(cellW * 0.88), y0 + (int)(cellH * 0.50)),
-                board.GetPixel(x0 + (int)(cellW * 0.50), y0 + (int)(cellH * 0.08))
-            };
-            double bgLuma = bgSamples.Select(c => 0.299 * c.R + 0.587 * c.G + 0.114 * c.B)
-                                     .OrderBy(v => v).ElementAt(1);
-
-            int srcX = (int)(x0 + cellW * 0.12);
-            int srcY = (int)(y0 + cellH * 0.12);
-            int srcW = Math.Max(PATCH_SIZE, (int)(cellW * 0.76));
-            int srcH = Math.Max(PATCH_SIZE, (int)(cellH * 0.76));
+            int srcX = Math.Clamp((int)(x0 + cellW * 0.08), 0, Math.Max(0, board.Width - 1));
+            int srcY = Math.Clamp((int)(y0 + cellH * 0.08), 0, Math.Max(0, board.Height - 1));
+            int srcW = Math.Clamp((int)(cellW * 0.84), 1, board.Width - srcX);
+            int srcH = Math.Clamp((int)(cellH * 0.84), 1, board.Height - srcY);
 
             using Bitmap patchBmp = new Bitmap(PATCH_SIZE, PATCH_SIZE, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
             using (Graphics g = Graphics.FromImage(patchBmp))
@@ -769,100 +887,337 @@ namespace ChGhost
                             new System.Drawing.Rectangle(srcX, srcY, srcW, srcH), GraphicsUnit.Pixel);
             }
 
-            double[,] lumaGrid = new double[PATCH_SIZE, PATCH_SIZE];
-            var pieceLumas = new List<double>();
+            var bmpData = patchBmp.LockBits(
+                new System.Drawing.Rectangle(0, 0, PATCH_SIZE, PATCH_SIZE),
+                System.Drawing.Imaging.ImageLockMode.ReadOnly,
+                System.Drawing.Imaging.PixelFormat.Format24bppRgb);
 
+            int stride = bmpData.Stride;
+            byte[] rawBytes = new byte[stride * PATCH_SIZE];
+            Marshal.Copy(bmpData.Scan0, rawBytes, 0, rawBytes.Length);
+            patchBmp.UnlockBits(bmpData);
+
+            double[,] rGrid = new double[PATCH_SIZE, PATCH_SIZE];
+            double[,] gGrid = new double[PATCH_SIZE, PATCH_SIZE];
+            double[,] bGrid = new double[PATCH_SIZE, PATCH_SIZE];
+            double[,] lumaGrid = new double[PATCH_SIZE, PATCH_SIZE];
+
+            for (int y = 0; y < PATCH_SIZE; y++)
+            {
+                int rowOffset = y * stride;
+                for (int x = 0; x < PATCH_SIZE; x++)
+                {
+                    int idx = rowOffset + x * 3;
+                    double b = rawBytes[idx];
+                    double g = rawBytes[idx + 1];
+                    double r = rawBytes[idx + 2];
+                    rGrid[y, x] = r;
+                    gGrid[y, x] = g;
+                    bGrid[y, x] = b;
+                    lumaGrid[y, x] = 0.299 * r + 0.587 * g + 0.114 * b;
+                }
+            }
+
+            var bgRs = new List<double>(80);
+            var bgGs = new List<double>(80);
+            var bgBs = new List<double>(80);
+
+            for (int x = 7; x <= 27; x++)
+            {
+                bgRs.Add(rGrid[0, x]); bgGs.Add(gGrid[0, x]); bgBs.Add(bGrid[0, x]);
+                bgRs.Add(rGrid[1, x]); bgGs.Add(gGrid[1, x]); bgBs.Add(bGrid[1, x]);
+            }
+            for (int y = 3; y <= 24; y++)
+            {
+                bgRs.Add(rGrid[y, 31]); bgGs.Add(gGrid[y, 31]); bgBs.Add(bGrid[y, 31]);
+            }
+            for (int y = 7; y <= 24; y++)
+            {
+                bgRs.Add(rGrid[y, 0]); bgGs.Add(gGrid[y, 0]); bgBs.Add(bGrid[y, 0]);
+            }
+
+            bgRs.Sort(); bgGs.Sort(); bgBs.Sort();
+            double bgR = bgRs[bgRs.Count / 2];
+            double bgG = bgGs[bgGs.Count / 2];
+            double bgB = bgBs[bgBs.Count / 2];
+
+            double[,] gradGrid = new double[PATCH_SIZE, PATCH_SIZE];
+            for (int y = 0; y < PATCH_SIZE; y++)
+            {
+                int ym = Math.Max(0, y - 1);
+                int yp = Math.Min(PATCH_SIZE - 1, y + 1);
+                for (int x = 0; x < PATCH_SIZE; x++)
+                {
+                    int xm = Math.Max(0, x - 1);
+                    int xp = Math.Min(PATCH_SIZE - 1, x + 1);
+
+                    double gxR = (rGrid[ym, xp] + 2 * rGrid[y, xp] + rGrid[yp, xp] - rGrid[ym, xm] - 2 * rGrid[y, xm] - rGrid[yp, xm]) * 0.25;
+                    double gyR = (rGrid[yp, xm] + 2 * rGrid[yp, x] + rGrid[yp, xp] - rGrid[ym, xm] - 2 * rGrid[ym, x] - rGrid[ym, xp]) * 0.25;
+
+                    double gxG = (gGrid[ym, xp] + 2 * gGrid[y, xp] + gGrid[yp, xp] - gGrid[ym, xm] - 2 * gGrid[y, xm] - gGrid[yp, xm]) * 0.25;
+                    double gyG = (gGrid[yp, xm] + 2 * gGrid[yp, x] + gGrid[yp, xp] - gGrid[ym, xm] - 2 * gGrid[ym, x] - gGrid[ym, xp]) * 0.25;
+
+                    double gxB = (bGrid[ym, xp] + 2 * bGrid[y, xp] + bGrid[yp, xp] - bGrid[ym, xm] - 2 * bGrid[y, xm] - bGrid[yp, xm]) * 0.25;
+                    double gyB = (bGrid[yp, xm] + 2 * bGrid[yp, x] + bGrid[yp, xp] - bGrid[ym, xm] - 2 * bGrid[ym, x] - bGrid[ym, xp]) * 0.25;
+
+                    gradGrid[y, x] = Math.Sqrt((gxR * gxR + gyR * gyR + gxG * gxG + gyG * gyG + gxB * gxB + gyB * gyB) / 3.0);
+                }
+            }
+
+            bool[,] isBg = new bool[PATCH_SIZE, PATCH_SIZE];
+            var queue = new Queue<(int x, int y)>(256);
+
+            double ColorDistToBg(int x, int y)
+            {
+                double dr = rGrid[y, x] - bgR;
+                double dg = gGrid[y, x] - bgG;
+                double db = bGrid[y, x] - bgB;
+                return Math.Sqrt(dr * dr + dg * dg + db * db);
+            }
+
+            void TrySeed(int x, int y)
+            {
+                if (isBg[y, x]) return;
+                if (ColorDistToBg(x, y) < 42.0 && gradGrid[y, x] < 32.0)
+                {
+                    isBg[y, x] = true;
+                    queue.Enqueue((x, y));
+                }
+            }
+
+            for (int i = 0; i < PATCH_SIZE; i++)
+            {
+                TrySeed(i, 0);
+                TrySeed(i, PATCH_SIZE - 1);
+                TrySeed(0, i);
+                TrySeed(PATCH_SIZE - 1, i);
+            }
+
+            int[] dx4 = { 1, -1, 0, 0 };
+            int[] dy4 = { 0, 0, 1, -1 };
+
+            while (queue.Count > 0)
+            {
+                var (cx, cy) = queue.Dequeue();
+                for (int d = 0; d < 4; d++)
+                {
+                    int nx = cx + dx4[d];
+                    int ny = cy + dy4[d];
+                    if (nx < 0 || nx >= PATCH_SIZE || ny < 0 || ny >= PATCH_SIZE || isBg[ny, nx])
+                        continue;
+
+                    if (ColorDistToBg(nx, ny) < 38.0 && gradGrid[ny, nx] < 26.0)
+                    {
+                        isBg[ny, nx] = true;
+                        queue.Enqueue((nx, ny));
+                    }
+                }
+            }
+
+            bool[,] rawFg = new bool[PATCH_SIZE, PATCH_SIZE];
             for (int y = 0; y < PATCH_SIZE; y++)
             {
                 for (int x = 0; x < PATCH_SIZE; x++)
                 {
-                    Color c = patchBmp.GetPixel(x, y);
-                    double luma = 0.299 * c.R + 0.587 * c.G + 0.114 * c.B;
-                    lumaGrid[y, x] = luma;
+                    rawFg[y, x] = !isBg[y, x] || ColorDistToBg(x, y) > 48.0;
+                }
+            }
 
-                    if (Math.Abs(luma - bgLuma) > 22)
-                        pieceLumas.Add(luma);
+            bool[,] pieceMask = new bool[PATCH_SIZE, PATCH_SIZE];
+            for (int y = 7; y <= 25; y++)
+            {
+                for (int x = 7; x <= 24; x++)
+                {
+                    if (rawFg[y, x] && !pieceMask[y, x])
+                    {
+                        pieceMask[y, x] = true;
+                        queue.Enqueue((x, y));
+                    }
+                }
+            }
+
+            while (queue.Count > 0)
+            {
+                var (cx, cy) = queue.Dequeue();
+                for (int d = 0; d < 4; d++)
+                {
+                    int nx = cx + dx4[d];
+                    int ny = cy + dy4[d];
+                    if (nx < 0 || nx >= PATCH_SIZE || ny < 0 || ny >= PATCH_SIZE)
+                        continue;
+                    if (rawFg[ny, nx] && !pieceMask[ny, nx])
+                    {
+                        pieceMask[ny, nx] = true;
+                        queue.Enqueue((nx, ny));
+                    }
                 }
             }
 
             int len = PATCH_SIZE * PATCH_SIZE;
             double[] edgeVec = new double[len];
+            double[] maskVec = new double[len];
+            var fgLumas = new List<double>(300);
+            int fgCount = 0;
+
             for (int y = 0; y < PATCH_SIZE; y++)
             {
                 for (int x = 0; x < PATCH_SIZE; x++)
                 {
-                    double gx = (x < PATCH_SIZE - 1) ? (lumaGrid[y, x + 1] - lumaGrid[y, x]) : 0;
-                    double gy = (y < PATCH_SIZE - 1) ? (lumaGrid[y + 1, x] - lumaGrid[y, x]) : 0;
-                    double grad = Math.Sqrt(gx * gx + gy * gy);
-                    double fgMask = Math.Abs(lumaGrid[y, x] - bgLuma) > 22 ? 60.0 : 0.0;
-                    edgeVec[y * PATCH_SIZE + x] = grad + fgMask;
-                }
-            }
+                    int idx = y * PATCH_SIZE + x;
+                    bool inPiece = pieceMask[y, x];
+                    bool nearPiece = inPiece
+                        || (x > 0 && pieceMask[y, x - 1])
+                        || (x < PATCH_SIZE - 1 && pieceMask[y, x + 1])
+                        || (y > 0 && pieceMask[y - 1, x])
+                        || (y < PATCH_SIZE - 1 && pieceMask[y + 1, x]);
 
-            double mean = edgeVec.Average();
-            double std = Math.Sqrt(edgeVec.Sum(v => (v - mean) * (v - mean)) / len);
+                    edgeVec[idx] = nearPiece ? gradGrid[y, x] : 0.0;
+                    maskVec[idx] = inPiece ? 1.0 : 0.0;
 
-            double[] norm = new double[len];
-            if (std > 1.0)
-            {
-                for (int i = 0; i < len; i++)
-                    norm[i] = (edgeVec[i] - mean) / std;
-            }
-
-            pieceLumas.Sort();
-            double coreLuma = pieceLumas.Count > 0
-                ? pieceLumas[(int)(pieceLumas.Count * 0.85)]
-                : 128.0;
-
-            return new PieceTemplate
-            {
-                EdgePatch = norm,
-                PieceLuma = coreLuma,
-                RawContrast = std,
-                IsWhite = coreLuma > 195.0
-            };
-        }
-
-        private (char piece, double confidence, double wkSim, double bkSim) RecognizeCell(PieceTemplate tpl)
-        {
-            if (tpl.RawContrast < 16.0)
-                return ('1', 0.0, -1.0, -1.0);
-
-            char bestPiece = '1';
-            double bestScore = -1.0;
-            double wkSim = -1.0;
-            double bkSim = -1.0;
-            int len = PATCH_SIZE * PATCH_SIZE;
-
-            foreach (var kv in _pieceSignatures)
-            {
-                bool targetIsWhite = char.IsUpper(kv.Key);
-                if (targetIsWhite != tpl.IsWhite) continue;
-
-                foreach (var sample in kv.Value)
-                {
-                    if (sample.EdgePatch.Length != len) continue;
-
-                    double dot = 0;
-                    for (int i = 0; i < len; i++)
-                        dot += tpl.EdgePatch[i] * sample.EdgePatch[i];
-                    double score = dot / len;
-
-                    if (kv.Key == 'K' && score > wkSim) wkSim = score;
-                    if (kv.Key == 'k' && score > bkSim) bkSim = score;
-
-                    if (score > bestScore)
+                    if (inPiece)
                     {
-                        bestScore = score;
-                        bestPiece = kv.Key;
+                        fgCount++;
+                        fgLumas.Add(lumaGrid[y, x]);
                     }
                 }
             }
 
-            if (bestScore < 0.20)
-                return ('1', 0.0, -1.0, -1.0);
+            double edgeMean = edgeVec.Average();
+            double edgeStd = Math.Sqrt(edgeVec.Sum(v => (v - edgeMean) * (v - edgeMean)) / len);
+            double[] edgeNorm = new double[len];
+            if (edgeStd > 1.0)
+            {
+                for (int i = 0; i < len; i++)
+                    edgeNorm[i] = (edgeVec[i] - edgeMean) / edgeStd;
+            }
 
-            return (bestPiece, bestScore, wkSim, bkSim);
+            double maskMean = maskVec.Average();
+            double maskStd = Math.Sqrt(maskVec.Sum(v => (v - maskMean) * (v - maskMean)) / len);
+            double[] maskNorm = new double[len];
+            if (maskStd > 0.01)
+            {
+                for (int i = 0; i < len; i++)
+                    maskNorm[i] = (maskVec[i] - maskMean) / maskStd;
+            }
+
+            fgLumas.Sort();
+            double coreLuma = fgLumas.Count > 0
+                ? fgLumas[(int)(fgLumas.Count * 0.65)]
+                : 128.0;
+
+            return new PieceTemplate
+            {
+                EdgePatch = edgeNorm,
+                MaskPatch = maskNorm,
+                PieceLuma = coreLuma,
+                RawContrast = edgeStd,
+                ForegroundPixels = fgCount,
+                IsWhite = coreLuma >= _whiteBlackThreshold
+            };
+        }
+
+        private static double ComputeShiftSimilarity(PieceTemplate a, PieceTemplate b)
+        {
+            double[] ae = a.EdgePatch;
+            double[] be = b.EdgePatch;
+            double[] am = a.MaskPatch;
+            double[] bm = b.MaskPatch;
+            int expectedLen = PATCH_SIZE * PATCH_SIZE;
+            if (ae.Length != expectedLen || be.Length != expectedLen || am.Length != expectedLen || bm.Length != expectedLen)
+                return -1.0;
+
+            double bestScore = -1.0;
+            const double invCount = 1.0 / (30.0 * 30.0);
+
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    double edgeDot = 0.0;
+                    double maskDot = 0.0;
+
+                    for (int y = 1; y < PATCH_SIZE - 1; y++)
+                    {
+                        int rowA = y * PATCH_SIZE;
+                        int rowB = (y + dy) * PATCH_SIZE + dx;
+                        for (int x = 1; x < PATCH_SIZE - 1; x++)
+                        {
+                            int ia = rowA + x;
+                            int ib = rowB + x;
+                            edgeDot += ae[ia] * be[ib];
+                            maskDot += am[ia] * bm[ib];
+                        }
+                    }
+
+                    double score = 0.62 * (edgeDot * invCount) + 0.38 * (maskDot * invCount);
+                    if (score > bestScore)
+                        bestScore = score;
+                }
+            }
+
+            return bestScore;
+        }
+
+        private static (char piece, double confidence, double[] scores) RecognizeCellFull(
+            PieceTemplate tpl,
+            Dictionary<char, List<PieceTemplate>> signatures,
+            double whiteBlackThreshold)
+        {
+            double[] scores = { -1.0, -1.0, -1.0, -1.0, -1.0, -1.0 };
+            if (!IsCellOccupied(tpl))
+                return ('1', 0.0, scores);
+
+            bool isWhite = tpl.PieceLuma >= whiteBlackThreshold;
+            char bestPiece = '1';
+            double bestScore = -1.0;
+
+            for (int idx = 0; idx < PieceTypesUpper.Length; idx++)
+            {
+                char key = isWhite ? PieceTypesUpper[idx] : char.ToLower(PieceTypesUpper[idx]);
+                if (!signatures.TryGetValue(key, out var samples))
+                    continue;
+
+                double maxSim = -1.0;
+                foreach (var sample in samples)
+                {
+                    double sim = ComputeShiftSimilarity(tpl, sample);
+                    if (sim > maxSim)
+                        maxSim = sim;
+                }
+
+                scores[idx] = maxSim;
+                if (maxSim > bestScore)
+                {
+                    bestScore = maxSim;
+                    bestPiece = key;
+                }
+            }
+
+            if (bestScore < 0.24)
+                return ('1', 0.0, scores);
+
+            return (bestPiece, bestScore, scores);
+        }
+
+        private static char BestPieceFromScores(double[] scores, bool isWhite, bool allowPawn, bool allowKing)
+        {
+            int bestIdx = -1;
+            double bestVal = double.NegativeInfinity;
+
+            for (int i = 0; i < 6; i++)
+            {
+                if (!allowPawn && i == 0) continue;
+                if (!allowKing && i == 5) continue;
+                if (scores[i] > bestVal)
+                {
+                    bestVal = scores[i];
+                    bestIdx = i;
+                }
+            }
+
+            if (bestIdx < 0) bestIdx = 4;
+            char upper = PieceTypesUpper[bestIdx];
+            return isWhite ? upper : char.ToLower(upper);
         }
 
         private (char[,] grid, Point? lockedWhiteKing, Point? lockedBlackKing) StabilizeGridWithTracking(char[,] rawGrid)
@@ -922,21 +1277,13 @@ namespace ChGhost
             if (departed.Count == 1 && arrived.Count == 1)
             {
                 char movedPiece = departed[0].piece;
-                char detectedAtDest = arrived[0].detectedPiece;
+                bool isPromotion = char.ToUpper(movedPiece) == 'P' && (arrived[0].r == 0 || arrived[0].r == 7);
 
-                if (movedPiece == 'K' || movedPiece == 'k')
+                if (!isPromotion)
                 {
                     stabilized[arrived[0].r, arrived[0].c] = movedPiece;
                     if (movedPiece == 'K') lockedWK = new Point(arrived[0].c, arrived[0].r);
                     if (movedPiece == 'k') lockedBK = new Point(arrived[0].c, arrived[0].r);
-                }
-                else
-                {
-                    bool isPromotion = char.ToUpper(movedPiece) == 'P' && (arrived[0].r == 0 || arrived[0].r == 7);
-                    if (!isPromotion && char.IsUpper(movedPiece) == char.IsUpper(detectedAtDest))
-                    {
-                        stabilized[arrived[0].r, arrived[0].c] = movedPiece;
-                    }
                 }
             }
             else if (departed.Count == 2 && arrived.Count == 1)
@@ -993,14 +1340,25 @@ namespace ChGhost
             return sb.ToString();
         }
 
+        private Dictionary<char, List<PieceTemplate>> SnapshotSignatures()
+        {
+            return _pieceSignatures.ToDictionary(
+                kv => kv.Key,
+                kv => kv.Value.ToList()
+            );
+        }
+
         private async Task ScanAndSuggestAsync(bool forceCalculate = false)
         {
-            if (_isScanning) return;
+            if (_isScanning || !HasValidBoardBounds() || !HasValidSignatures()) return;
 
             if (!forceCalculate && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0)
                 return;
 
             _isScanning = true;
+            bool playAsBlackSnap = _playAsBlack;
+            double wbThresholdSnap = _whiteBlackThreshold;
+            var signaturesSnap = SnapshotSignatures();
 
             try
             {
@@ -1015,22 +1373,20 @@ namespace ChGhost
                 {
                     using Bitmap bmp = CaptureBoard();
                     char[,] grid = new char[8, 8];
-                    double[,] wkSim = new double[8, 8];
-                    double[,] bkSim = new double[8, 8];
+                    double[,][] scoreMatrix = new double[8, 8][];
                     var activeCells = new List<(int r, int c, double score)>();
 
                     for (int r = 0; r < 8; r++)
                     {
                         for (int c = 0; c < 8; c++)
                         {
-                            int boardR = _playAsBlack ? 7 - r : r;
-                            int boardC = _playAsBlack ? 7 - c : c;
+                            int boardR = playAsBlackSnap ? 7 - r : r;
+                            int boardC = playAsBlackSnap ? 7 - c : c;
                             var tpl = ExtractPieceTemplate32x32(bmp, r, c);
-                            var res = RecognizeCell(tpl);
+                            var res = RecognizeCellFull(tpl, signaturesSnap, wbThresholdSnap);
 
                             grid[boardR, boardC] = res.piece;
-                            wkSim[boardR, boardC] = res.wkSim;
-                            bkSim[boardR, boardC] = res.bkSim;
+                            scoreMatrix[boardR, boardC] = res.scores;
 
                             if (res.piece != '1')
                                 activeCells.Add((boardR, boardC, res.confidence));
@@ -1044,7 +1400,7 @@ namespace ChGhost
                             grid[d.r, d.c] = '1';
                     }
 
-                    return (rawFen: GridToFen(grid), grid: grid, wkSim: wkSim, bkSim: bkSim);
+                    return (rawFen: GridToFen(grid), grid: grid, scores: scoreMatrix);
                 });
 
                 if (!forceCalculate && scanResult.rawFen != _lastRawFen)
@@ -1057,16 +1413,22 @@ namespace ChGhost
                 var tracked = StabilizeGridWithTracking(scanResult.grid);
                 char[,] stableGrid = tracked.grid;
 
-                FixKingCountProtected(stableGrid, scanResult.wkSim, 'K', isWhite: true, lockedKing: tracked.lockedWhiteKing);
-                FixKingCountProtected(stableGrid, scanResult.bkSim, 'k', isWhite: false, lockedKing: tracked.lockedBlackKing);
-
                 for (int c = 0; c < 8; c++)
                 {
-                    if (stableGrid[0, c] == 'P') stableGrid[0, c] = 'Q';
-                    if (stableGrid[0, c] == 'p') stableGrid[0, c] = 'q';
-                    if (stableGrid[7, c] == 'P') stableGrid[7, c] = 'Q';
-                    if (stableGrid[7, c] == 'p') stableGrid[7, c] = 'q';
+                    if (stableGrid[0, c] == 'P')
+                        stableGrid[0, c] = BestPieceFromScores(scanResult.scores[0, c], isWhite: true, allowPawn: false, allowKing: true);
+                    if (stableGrid[0, c] == 'p')
+                        stableGrid[0, c] = BestPieceFromScores(scanResult.scores[0, c], isWhite: false, allowPawn: false, allowKing: true);
+                    if (stableGrid[7, c] == 'P')
+                        stableGrid[7, c] = BestPieceFromScores(scanResult.scores[7, c], isWhite: true, allowPawn: false, allowKing: true);
+                    if (stableGrid[7, c] == 'p')
+                        stableGrid[7, c] = BestPieceFromScores(scanResult.scores[7, c], isWhite: false, allowPawn: false, allowKing: true);
                 }
+
+                EnforceKingConstraint(stableGrid, scanResult.scores, isWhite: true, lockedKing: tracked.lockedWhiteKing);
+                EnforceKingConstraint(stableGrid, scanResult.scores, isWhite: false, lockedKing: tracked.lockedBlackKing);
+                EnforcePawnCap(stableGrid, scanResult.scores, isWhite: true);
+                EnforcePawnCap(stableGrid, scanResult.scores, isWhite: false);
 
                 int whiteKings = 0, blackKings = 0;
                 for (int r = 0; r < 8; r++)
@@ -1078,7 +1440,7 @@ namespace ChGhost
 
                 if (whiteKings != 1 || blackKings != 1)
                 {
-                    _debugInfo = $"Не вижу королей (Б={whiteKings}, Ч={blackKings}).";
+                    _debugInfo = $"Не вижу королей (Б={whiteKings}, Ч={blackKings}). Нажмите Alt+3 для пересчёта.";
                     UpdateUI();
                     return;
                 }
@@ -1108,7 +1470,7 @@ namespace ChGhost
                             if (oldCell != newCell && newCell != '1')
                             {
                                 bool isWhitePiece = char.IsUpper(newCell);
-                                bool isMyPiece = _playAsBlack ? !isWhitePiece : isWhitePiece;
+                                bool isMyPiece = playAsBlackSnap ? !isWhitePiece : isWhitePiece;
                                 if (isMyPiece) iMoved = true;
                                 else opponentMoved = true;
                             }
@@ -1119,7 +1481,6 @@ namespace ChGhost
                     {
                         _lastStableFen = stableFen;
                         _confirmedGrid = stableGrid;
-                        _seenPositions.Add(stableFen);
                         _lastBestMove = "";
                         _lastMoveRussianText = "";
                         _lastMoveIsCastling = false;
@@ -1132,7 +1493,6 @@ namespace ChGhost
 
                 _lastStableFen = stableFen;
                 _confirmedGrid = stableGrid;
-                _seenPositions.Add(stableFen);
 
                 if (!isMyTurn)
                 {
@@ -1140,7 +1500,7 @@ namespace ChGhost
                     return;
                 }
 
-                char turn = _playAsBlack ? 'b' : 'w';
+                char turn = playAsBlackSnap ? 'b' : 'w';
                 string castlingRights = DetectCastlingRights(stableGrid);
                 string fullFen = $"{stableFen} {turn} {castlingRights} - 0 1";
                 int moveTimeMs = _isBlitzTurboMode ? 180 : 550;
@@ -1192,6 +1552,100 @@ namespace ChGhost
             }
         }
 
+        private static void EnforceKingConstraint(char[,] grid, double[,][] scores, bool isWhite, Point? lockedKing)
+        {
+            char kingChar = isWhite ? 'K' : 'k';
+
+            if (lockedKing.HasValue)
+            {
+                int kr = lockedKing.Value.Y;
+                int kc = lockedKing.Value.X;
+                for (int r = 0; r < 8; r++)
+                {
+                    for (int c = 0; c < 8; c++)
+                    {
+                        if (r == kr && c == kc)
+                            grid[r, c] = kingChar;
+                        else if (grid[r, c] == kingChar)
+                            grid[r, c] = BestPieceFromScores(scores[r, c], isWhite, allowPawn: r > 0 && r < 7, allowKing: false);
+                    }
+                }
+                return;
+            }
+
+            var kings = new List<(int r, int c, double score, double margin)>();
+            var sameColor = new List<(int r, int c, double kingScore)>();
+
+            for (int r = 0; r < 8; r++)
+            {
+                for (int c = 0; c < 8; c++)
+                {
+                    char p = grid[r, c];
+                    if (p == '1' || char.IsUpper(p) != isWhite) continue;
+
+                    double kScore = scores[r, c][5];
+                    sameColor.Add((r, c, kScore));
+
+                    if (p == kingChar)
+                    {
+                        double bestOther = -1.0;
+                        for (int i = 0; i < 5; i++)
+                        {
+                            if ((r == 0 || r == 7) && i == 0) continue;
+                            if (scores[r, c][i] > bestOther) bestOther = scores[r, c][i];
+                        }
+                        kings.Add((r, c, kScore, kScore - bestOther));
+                    }
+                }
+            }
+
+            if (kings.Count == 0 && sameColor.Count > 0)
+            {
+                var best = sameColor.OrderByDescending(x => x.kingScore).First();
+                grid[best.r, best.c] = kingChar;
+            }
+            else if (kings.Count > 1)
+            {
+                var ordered = kings.OrderByDescending(x => x.margin).ThenByDescending(x => x.score).ToList();
+                for (int i = 1; i < ordered.Count; i++)
+                {
+                    int rr = ordered[i].r;
+                    int cc = ordered[i].c;
+                    grid[rr, cc] = BestPieceFromScores(scores[rr, cc], isWhite, allowPawn: rr > 0 && rr < 7, allowKing: false);
+                }
+            }
+        }
+
+        private static void EnforcePawnCap(char[,] grid, double[,][] scores, bool isWhite)
+        {
+            char pawnChar = isWhite ? 'P' : 'p';
+            var pawns = new List<(int r, int c, double margin)>();
+
+            for (int r = 1; r < 7; r++)
+            {
+                for (int c = 0; c < 8; c++)
+                {
+                    if (grid[r, c] != pawnChar) continue;
+                    double pScore = scores[r, c][0];
+                    double bestNonPawn = -1.0;
+                    for (int i = 1; i < 5; i++)
+                    {
+                        if (scores[r, c][i] > bestNonPawn) bestNonPawn = scores[r, c][i];
+                    }
+                    pawns.Add((r, c, pScore - bestNonPawn));
+                }
+            }
+
+            if (pawns.Count > 8)
+            {
+                var excess = pawns.OrderBy(x => x.margin).Take(pawns.Count - 8);
+                foreach (var item in excess)
+                {
+                    grid[item.r, item.c] = BestPieceFromScores(scores[item.r, item.c], isWhite, allowPawn: false, allowKing: false);
+                }
+            }
+        }
+
         private static string DetectCastlingRights(char[,] grid)
         {
             StringBuilder rights = new();
@@ -1206,58 +1660,6 @@ namespace ChGhost
                 if (grid[0, 0] == 'r') rights.Append('q');
             }
             return rights.Length > 0 ? rights.ToString() : "-";
-        }
-
-        private void FixKingCountProtected(char[,] grid, double[,] kingSim, char kingChar, bool isWhite, Point? lockedKing)
-        {
-            if (lockedKing.HasValue)
-            {
-                int kr = lockedKing.Value.Y;
-                int kc = lockedKing.Value.X;
-                for (int r = 0; r < 8; r++)
-                {
-                    for (int c = 0; c < 8; c++)
-                    {
-                        if (r == kr && c == kc)
-                            grid[r, c] = kingChar;
-                        else if (grid[r, c] == kingChar)
-                            grid[r, c] = isWhite ? 'Q' : 'q';
-                    }
-                }
-                return;
-            }
-
-            var kings = new List<(int r, int c, double sim)>();
-            var sameColorPieces = new List<(int r, int c, double sim)>();
-
-            for (int r = 0; r < 8; r++)
-            {
-                for (int c = 0; c < 8; c++)
-                {
-                    char p = grid[r, c];
-                    if (p == '1') continue;
-                    bool pieceIsWhite = char.IsUpper(p);
-                    if (pieceIsWhite == isWhite)
-                    {
-                        sameColorPieces.Add((r, c, kingSim[r, c]));
-                        if (p == kingChar) kings.Add((r, c, kingSim[r, c]));
-                    }
-                }
-            }
-
-            if (kings.Count == 0 && sameColorPieces.Count > 0)
-            {
-                var best = sameColorPieces.OrderByDescending(x => x.sim).First();
-                grid[best.r, best.c] = kingChar;
-            }
-            else if (kings.Count > 1)
-            {
-                var ordered = kings.OrderByDescending(x => x.sim).ToList();
-                for (int i = 1; i < ordered.Count; i++)
-                {
-                    grid[ordered[i].r, ordered[i].c] = isWhite ? 'Q' : 'q';
-                }
-            }
         }
 
         private string QueryStockfish(string fen, int moveTimeMs)
@@ -1320,7 +1722,7 @@ namespace ChGhost
 
         private void DrawXRayLabels(char[,] grid)
         {
-            if (_topLeft == Point.Empty || _bottomRight == Point.Empty) return;
+            if (!HasValidBoardBounds()) return;
 
             var source = PresentationSource.FromVisual(this);
             double dpiX = source?.CompositionTarget?.TransformFromDevice.M11 ?? 1.0;

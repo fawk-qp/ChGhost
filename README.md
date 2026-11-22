@@ -1,24 +1,19 @@
-# ChGhost
+# ChGhost v1.1
 
-ChGhost is a Windows x64 WPF chess overlay with board calibration, piece recognition, move tracking, and Stockfish analysis.
+ChGhost is a Windows x64 WPF chess overlay with board calibration, move tracking, and Stockfish analysis.
 
-## Features
+## Recognition v10
 
-- Transparent, always-on-top WPF overlay. The window uses `WDA_EXCLUDEFROMCAPTURE` to exclude it from screen capture.
-- Board calibration by selecting opposite corners, with piece recognition based on 32x32 image patches and Sobel gradient features.
-- Move tracking and position synchronization during a game.
-- Castling recognition, including the `0-0` and `0-0-0` notations.
-- Blitz (180 ms) and Rapid (550 ms) move-time presets.
-- Stockfish strength toggle between MAX and 2600 Elo.
-- Optional X-Ray piece markers and manual piece calibration.
+- Calibration is stored in `board_auto_v10.json`.
+- Recognition combines RGB Sobel edges, flood-fill background masking, and an adaptive light/dark threshold.
+- `LockBits` speeds up pixel access; shift matching tolerates offsets of up to ±1 px.
+- King and pawn constraints help stabilize the detected position, including after captures.
 
-## Run a GitHub Release build
+## Download and run
 
-1. Download and extract `ChGhost_v1.0_Win64.zip` from the project's GitHub Releases page.
-2. Make sure `stockfish.exe` is in the same folder as `ChGhost.exe`.
-3. Run `ChGhost.exe`.
+Download [`ChGhost_v1.1_Win64.zip`](https://github.com/fawk-ux/ChGhost/releases/download/v1.1/ChGhost_v1.1_Win64.zip) from GitHub Releases and extract it. Keep `stockfish.exe` next to `ChGhost.exe`, then launch `ChGhost.exe`.
 
-The application is published as a self-contained Windows x64 single-file executable; a separate .NET runtime installation is not required. Stockfish remains a separate executable and must be next to `ChGhost.exe`.
+The app is self-contained; a separate .NET runtime installation is not required.
 
 ## Hotkeys
 
