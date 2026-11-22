@@ -27,6 +27,8 @@ The application is published as a self-contained Windows x64 single-file executa
 | `Alt + 1` | Set the board's upper-left corner (A8 / H1) |
 | `Alt + 2` | Set the board's lower-right corner (H1 / A8) |
 | `Alt + 3` | Smart action: auto-calibrate the 32 starting pieces, or synchronize the current position mid-game |
+| `Alt + 5` | Reset board calibration |
+| `Alt + R` | Force a recalculation |
 | `Alt + C` | Switch the playing side (White / Black) |
 | `Alt + B` | Switch speed preset (Blitz 180 ms / Rapid 550 ms) |
 | `Alt + E` | Switch engine strength (MAX / 2600 Elo) |

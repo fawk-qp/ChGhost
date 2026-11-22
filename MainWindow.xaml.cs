@@ -39,7 +39,6 @@ namespace ChGhost
 
     public partial class MainWindow : Window
     {
-        // --- Win32 API ---
         private const uint WDA_EXCLUDEFROMCAPTURE = 0x00000011;
         private const int GWL_EXSTYLE = -20;
         private const int WS_EX_TRANSPARENT = 0x00000020;
@@ -73,7 +72,6 @@ namespace ChGhost
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
 
-        // --- Настройки движка (максимальная мощность без потери стабильности) ---
         private bool _fullStrength = true;
         private const int TARGET_ELO = 2600;
         private static readonly int ENGINE_THREADS = Math.Max(4, Environment.ProcessorCount - 2);
@@ -115,7 +113,6 @@ namespace ChGhost
         private bool _lastMoveIsCastling = false;
         private string _debugInfo = "";
 
-        // История позиций текущей партии для защиты от ничьей повторением
         private readonly HashSet<string> _seenPositions = new();
 
         private char[,]? _confirmedGrid = null;
@@ -150,20 +147,20 @@ namespace ChGhost
             SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT);
 
             uint mods = MOD_ALT | MOD_NOREPEAT;
-            RegisterHotKey(hwnd, 1, mods, 0x31); // Alt+1 — угол A8
-            RegisterHotKey(hwnd, 2, mods, 0x32); // Alt+2 — угол H1
-            RegisterHotKey(hwnd, 3, mods, 0x33); // Alt+3 — умная авто-калибровка / синхронизация
-            RegisterHotKey(hwnd, 4, mods, 0x34); // Alt+4 — выбор фигуры для ручной правки
-            RegisterHotKey(hwnd, 5, mods, 0x35); // Alt+5 — полный сброс
-            RegisterHotKey(hwnd, 6, mods, 0x53); // Alt+S — старт / пауза
-            RegisterHotKey(hwnd, 7, mods, 0x43); // Alt+C — смена стороны (Белые / Чёрные)
-            RegisterHotKey(hwnd, 8, mods, 0x48); // Alt+H — скрыть / показать оверлей
-            RegisterHotKey(hwnd, 9, mods, 0x51); // Alt+Q — выход
-            RegisterHotKey(hwnd, 10, mods, 0x52); // Alt+R — принудительный пересчёт
-            RegisterHotKey(hwnd, 11, mods, 0x44); // Alt+D — X-Ray метки на клетках
-            RegisterHotKey(hwnd, 12, mods, 0x46); // Alt+F — записать выбранную фигуру под курсором
-            RegisterHotKey(hwnd, 14, mods, 0x42); // Alt+B — Блиц / Рапид
-            RegisterHotKey(hwnd, 15, mods, 0x45); // Alt+E — сила движка MAX / 2600 Elo
+            RegisterHotKey(hwnd, 1, mods, 0x31);
+            RegisterHotKey(hwnd, 2, mods, 0x32);
+            RegisterHotKey(hwnd, 3, mods, 0x33);
+            RegisterHotKey(hwnd, 4, mods, 0x34);
+            RegisterHotKey(hwnd, 5, mods, 0x35);
+            RegisterHotKey(hwnd, 6, mods, 0x53);
+            RegisterHotKey(hwnd, 7, mods, 0x43);
+            RegisterHotKey(hwnd, 8, mods, 0x48);
+            RegisterHotKey(hwnd, 9, mods, 0x51);
+            RegisterHotKey(hwnd, 10, mods, 0x52);
+            RegisterHotKey(hwnd, 11, mods, 0x44);
+            RegisterHotKey(hwnd, 12, mods, 0x46);
+            RegisterHotKey(hwnd, 14, mods, 0x42);
+            RegisterHotKey(hwnd, 15, mods, 0x45);
 
             HwndSource.FromHwnd(hwnd)?.AddHook(WndProc);
             UpdateUI();
@@ -1195,10 +1192,6 @@ namespace ChGhost
             }
         }
 
-        /// <summary>
-        /// Автоматически определяет права на рокировку по расположению королей и ладей на стартовых клетках
-        /// (усиливает игру движка, разрешая ему планировать и выполнять 0-0 и 0-0-0)
-        /// </summary>
         private static string DetectCastlingRights(char[,] grid)
         {
             StringBuilder rights = new();
