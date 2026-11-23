@@ -14,3 +14,8 @@ board_auto_v7.json
 board_auto_v8.json
 board_auto_v9.json
 board_config_v4.json
+ml_pipeline/data/
+ml_pipeline/assets/
+ml_pipeline/__pycache__/
+ml_pipeline/.venv/
+models/*.onnx

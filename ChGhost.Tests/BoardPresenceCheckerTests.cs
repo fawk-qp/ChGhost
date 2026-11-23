@@ -1,0 +1,83 @@
+using ChGhost.Core.Vision;
+
+namespace ChGhost.Tests;
+
+public class BoardPresenceCheckerTests
+{
+    private const int Width = 512;
+    private const int Height = 512;
+    private const int TileSize = 64;
+    private const int Stride = Width * 3;
+
+    [Fact]
+    public void Checkerboard_IsPresent()
+    {
+        byte[] buffer = CreateBoard(highlighted: false);
+
+        Assert.True(BoardPresenceChecker.IsCheckerboardPresent(buffer, Stride));
+    }
+
+    [Fact]
+    public void CheckerboardWithHighlights_IsPresent()
+    {
+        byte[] buffer = CreateBoard(highlighted: true);
+
+        Assert.True(BoardPresenceChecker.IsCheckerboardPresent(buffer, Stride));
+    }
+
+    [Fact]
+    public void DarkBackground_IsNotPresent()
+    {
+        var buffer = new byte[Stride * Height];
+        for (int i = 0; i < buffer.Length; i += 3)
+        {
+            buffer[i] = 20;
+            buffer[i + 1] = 20;
+            buffer[i + 2] = 20;
+        }
+
+        Assert.False(BoardPresenceChecker.IsCheckerboardPresent(buffer, Stride));
+    }
+
+    [Fact]
+    public void HorizontalWindowStripes_AreNotPresent()
+    {
+        var buffer = new byte[Stride * Height];
+        for (int y = 0; y < Height; y++)
+        {
+            byte value = (byte)(((y / 16) & 1) == 0 ? 180 : 60);
+            int row = y * Stride;
+            for (int x = 0; x < Width; x++)
+            {
+                int offset = row + x * 3;
+                buffer[offset] = value;
+                buffer[offset + 1] = value;
+                buffer[offset + 2] = value;
+            }
+        }
+
+        Assert.False(BoardPresenceChecker.IsCheckerboardPresent(buffer, Stride));
+    }
+
+    private static byte[] CreateBoard(bool highlighted)
+    {
+        var buffer = new byte[Stride * Height];
+        for (int y = 0; y < Height; y++)
+        {
+            int sr = y / TileSize;
+            int row = y * Stride;
+            for (int x = 0; x < Width; x++)
+            {
+                int sc = x / TileSize;
+                bool even = ((sr + sc) & 1) == 0;
+                bool highlight = highlighted && sr == sc && sr < 4;
+                byte value = (byte)(highlight || !even ? 35 : 210);
+                int offset = row + x * 3;
+                buffer[offset] = value;
+                buffer[offset + 1] = value;
+                buffer[offset + 2] = value;
+            }
+        }
+        return buffer;
+    }
+}
