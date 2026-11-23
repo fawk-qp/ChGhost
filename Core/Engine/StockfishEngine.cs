@@ -234,6 +234,8 @@ public sealed class StockfishEngine : IChessEngine
                 string? line = await process.StandardOutput.ReadLineAsync().ConfigureAwait(false);
                 if (line == null)
                     break;
+                if (line.StartsWith("info string CRITICAL ERROR", StringComparison.Ordinal))
+                    _logger.Error(line);
                 await writer.WriteAsync(line).ConfigureAwait(false);
             }
             writer.TryComplete(process.HasExited

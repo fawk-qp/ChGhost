@@ -121,6 +121,42 @@ public class FenLegalityValidatorTests
         Assert.False(isLegal);
     }
 
+    [Fact]
+    public void Validate_ThreeWhiteRooksWithEightPawns_ReturnsFalse()
+    {
+        char[,] grid = GridFromRows(
+            "rnbqkbnr",
+            "pppppppp",
+            "11111111",
+            "11111111",
+            "1111P111",
+            "11111111",
+            "PPPP1PPP",
+            "RKR11BNR");
+
+        (bool isLegal, string? reason) = FenLegalityValidator.Validate(grid, whiteToMove: false);
+
+        Assert.False(isLegal, reason);
+    }
+
+    [Fact]
+    public void Validate_ThreeWhiteRooksWithSevenPawns_ReturnsTrue()
+    {
+        char[,] grid = GridFromRows(
+            "rnbqkbnr",
+            "pppppppp",
+            "11111111",
+            "11111111",
+            "11111111",
+            "11111111",
+            "PPPP1PPP",
+            "RKR11BNR");
+
+        (bool isLegal, string? reason) = FenLegalityValidator.Validate(grid, whiteToMove: false);
+
+        Assert.True(isLegal, reason);
+    }
+
     private static char[,] EmptyGrid()
     {
         var grid = new char[8, 8];
