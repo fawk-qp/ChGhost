@@ -1,10 +1,9 @@
 using System;
+using System.ComponentModel;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows;
@@ -13,8 +12,12 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
+using ChGhost.Core.Configuration;
 using ChGhost.Core.Contracts;
+using ChGhost.Core.Diagnostics;
+using ChGhost.Core.Engine;
 using ChGhost.Core.Models;
+using ChGhost.Core.Native;
 using ChGhost.Core.Tracking;
 using ChGhost.Core.Vision;
 using Color = System.Drawing.Color;
@@ -24,46 +27,13 @@ namespace ChGhost
 {
     public partial class MainWindow : Window
     {
-        private const uint WDA_EXCLUDEFROMCAPTURE = 0x00000011;
-        private const int GWL_EXSTYLE = -20;
-        private const int WS_EX_TRANSPARENT = 0x00000020;
-        private const int WS_EX_LAYERED = 0x00080000;
-        private const int WM_HOTKEY = 0x0312;
-        private const uint MOD_ALT = 0x0001;
-        private const uint MOD_NOREPEAT = 0x4000;
-        private const int VK_LBUTTON = 0x01;
-
-        [DllImport("user32.dll")]
-        private static extern bool SetProcessDPIAware();
-
-        [DllImport("user32.dll")]
-        private static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
-
-        [DllImport("user32.dll")]
-        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-
-        [DllImport("user32.dll")]
-        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
-
-        [DllImport("user32.dll")]
-        private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
-
-        [DllImport("user32.dll")]
-        private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
-
-        [DllImport("user32.dll")]
-        private static extern bool GetCursorPos(out Point lpPoint);
-
-        [DllImport("user32.dll")]
-        private static extern short GetAsyncKeyState(int vKey);
-
-        private bool _fullStrength = true;
-        private const int TARGET_ELO = 2600;
-        private static readonly int ENGINE_THREADS = Math.Max(4, Environment.ProcessorCount - 2);
-        private const int ENGINE_HASH_MB = 512;
-
         private const int PROFILE_COUNT = 3;
 
+        private readonly IAppLogger _logger;
+        private readonly SettingsStore _settingsStore;
+        private readonly AppSettings _settings;
+        private readonly IChessEngine _engine;
+        private readonly CancellationTokenSource _appLifetime = new();
         private int _activeProfile = 1;
         private readonly ICalibratableRecognizer _recognizer = new TemplateRecognizer();
         private readonly IBoardDetector _boardDetector = new ManualBoardDetector();
@@ -95,11 +65,10 @@ namespace ChGhost
         private bool _isHidden = false;
         private bool _showDebugOverlay = true;
         private bool _isBlitzTurboMode = true;
-
-        private Process? _stockfish;
-        private readonly object _sfLock = new();
-        private TaskCompletionSource<string>? _sfWaiter;
-        private string _sfExpectedPrefix = "";
+        private bool _closing;
+        private bool _allowClose;
+        private string _startupWarning = "";
+        private readonly HashSet<int> _registeredHotkeys = new();
 
         private readonly DispatcherTimer _scanTimer = new();
         private string _lastBestMove = "";
@@ -112,7 +81,13 @@ namespace ChGhost
 
         public MainWindow()
         {
-            SetProcessDPIAware();
+            _logger = new FileAppLogger();
+            _settingsStore = new SettingsStore(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json"), _logger);
+            _settings = _settingsStore.Load();
+            _engine = new StockfishEngine(
+                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "stockfish.exe"),
+                _settings,
+                _logger);
             InitializeComponent();
             LoadConfig();
 
@@ -125,8 +100,8 @@ namespace ChGhost
         private void ApplySpeedPreset()
         {
             _scanTimer.Interval = _isBlitzTurboMode
-                ? TimeSpan.FromMilliseconds(220)
-                : TimeSpan.FromMilliseconds(450);
+                ? TimeSpan.FromMilliseconds(_settings.ScanIntervalBlitzMs)
+                : TimeSpan.FromMilliseconds(_settings.ScanIntervalRapidMs);
         }
 
         protected override void OnSourceInitialized(EventArgs e)
@@ -134,38 +109,72 @@ namespace ChGhost
             base.OnSourceInitialized(e);
             IntPtr hwnd = new WindowInteropHelper(this).Handle;
 
-            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            if (!Win32Interop.TrySetWindowDisplayAffinity(hwnd, Win32Interop.WdaExcludeFromCapture, out int affinityError))
+                _logger.Warn($"SetWindowDisplayAffinity failed with Win32 error {affinityError}.");
 
-            int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-            SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED | WS_EX_TRANSPARENT);
+            int exStyle = Win32Interop.GetWindowLong(hwnd, Win32Interop.GwlExStyle);
+            if (!Win32Interop.TrySetWindowLong(
+                    hwnd,
+                    Win32Interop.GwlExStyle,
+                    exStyle | Win32Interop.WsExLayered | Win32Interop.WsExTransparent,
+                    out int styleError))
+                _logger.Warn($"SetWindowLong failed with Win32 error {styleError}.");
 
-            uint mods = MOD_ALT | MOD_NOREPEAT;
-            RegisterHotKey(hwnd, 1, mods, 0x31);
-            RegisterHotKey(hwnd, 2, mods, 0x32);
-            RegisterHotKey(hwnd, 3, mods, 0x33);
-            RegisterHotKey(hwnd, 4, mods, 0x34);
-            RegisterHotKey(hwnd, 5, mods, 0x35);
-            RegisterHotKey(hwnd, 6, mods, 0x53);
-            RegisterHotKey(hwnd, 7, mods, 0x43);
-            RegisterHotKey(hwnd, 8, mods, 0x48);
-            RegisterHotKey(hwnd, 9, mods, 0x51);
-            RegisterHotKey(hwnd, 10, mods, 0x52);
-            RegisterHotKey(hwnd, 11, mods, 0x44);
-            RegisterHotKey(hwnd, 12, mods, 0x46);
-            RegisterHotKey(hwnd, 14, mods, 0x42);
-            RegisterHotKey(hwnd, 15, mods, 0x45);
-            RegisterHotKey(hwnd, 16, mods, 0x50);
+            RegisterHotKeys(hwnd);
 
             HwndSource.FromHwnd(hwnd)?.AddHook(WndProc);
             UpdateUI();
         }
 
+        private void RegisterHotKeys(IntPtr hwnd)
+        {
+            (int Id, uint Key, string Name)[] hotkeys =
+            {
+                (1, 0x31, "Alt+1"), (2, 0x32, "Alt+2"), (3, 0x33, "Alt+3"),
+                (4, 0x34, "Alt+4"), (5, 0x35, "Alt+5"), (6, 0x53, "Alt+S"),
+                (7, 0x43, "Alt+C"), (8, 0x48, "Alt+H"), (9, 0x51, "Alt+Q"),
+                (10, 0x52, "Alt+R"), (11, 0x44, "Alt+D"), (12, 0x46, "Alt+F"),
+                (14, 0x42, "Alt+B"), (15, 0x45, "Alt+E"), (16, 0x50, "Alt+P")
+            };
+            var failed = new List<string>();
+            foreach (var hotkey in hotkeys)
+            {
+                if (Win32Interop.TryRegisterHotKey(
+                        hwnd,
+                        hotkey.Id,
+                        Win32Interop.ModAlt | Win32Interop.ModNoRepeat,
+                        hotkey.Key,
+                        out int errorCode))
+                {
+                    _registeredHotkeys.Add(hotkey.Id);
+                    continue;
+                }
+
+                failed.Add(hotkey.Name);
+                _logger.Warn($"RegisterHotKey failed for {hotkey.Name}; Win32 error {errorCode}.");
+            }
+
+            if (failed.Count > 0)
+                _startupWarning = $"Не зарегистрированы горячие клавиши: {string.Join(", ", failed)}.";
+        }
+
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
-            if (msg == WM_HOTKEY)
+            if (msg == Win32Interop.WmHotkey)
             {
                 int id = wParam.ToInt32();
-                GetCursorPos(out Point cursor);
+                Point cursor;
+                try
+                {
+                    cursor = Win32Interop.GetCursorPosition();
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("Unable to read cursor position for hotkey.", ex);
+                    UpdateUI("Не удалось получить позицию курсора.");
+                    handled = true;
+                    return IntPtr.Zero;
+                }
 
                 switch (id)
                 {
@@ -239,11 +248,19 @@ namespace ChGhost
                         break;
 
                     case 15:
-                        _fullStrength = !_fullStrength;
-                        KillStockfish();
+                        _settings.FullStrength = !_settings.FullStrength;
+                        try
+                        {
+                            _settingsStore.Save(_settings);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            _logger.Error("Unable to save settings after changing engine strength.", ex);
+                            _startupWarning = "Не удалось сохранить настройки движка.";
+                        }
+                        _ = RestartEngineAsync();
                         UpdateUI();
-                        if (_isRunning)
-                            _ = ScanAndSuggestAsync(forceCalculate: true);
+                        if (_isRunning) _ = ScanAndSuggestAsync(forceCalculate: true);
                         break;
 
                     case 16:
@@ -313,7 +330,6 @@ namespace ChGhost
                 _playAsBlack = calibration.PlayAsBlack;
                 SaveConfig();
                 ResetBoardTracking();
-                SendUciNewGame();
                 ClearGraphics();
 
                 if (!_isRunning)
@@ -324,7 +340,7 @@ namespace ChGhost
 
                 string sideDetected = _playAsBlack ? "ЧЁРНЫЕ" : "БЕЛЫЕ";
                 UpdateUI($"[П{_activeProfile}] Старт v13 снят ({sideDetected}, Б={calibration.WhiteLuma:F0}/Ч={calibration.BlackLuma:F0}) -> Считаю ход...");
-                _ = ScanAndSuggestAsync(forceCalculate: true);
+                _ = StartNewGameAndScanAsync();
                 return;
             }
 
@@ -417,6 +433,43 @@ namespace ChGhost
             _currentGrid = null;
         }
 
+        private async Task StartNewGameAndScanAsync()
+        {
+            try
+            {
+                await _engine.NewGameAsync(_appLifetime.Token);
+                await ScanAndSuggestAsync(forceCalculate: true);
+            }
+            catch (OperationCanceledException) when (_appLifetime.IsCancellationRequested)
+            {
+                _logger.Info("New-game request cancelled during application shutdown.");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Unable to start a new Stockfish game.", ex);
+                UpdateUI($"Ошибка Stockfish: {ex.Message}");
+            }
+        }
+
+        private async Task RestartEngineAsync()
+        {
+            try
+            {
+                await _engine.RestartAsync(_appLifetime.Token);
+                if (_isRunning)
+                    await ScanAndSuggestAsync(forceCalculate: true);
+            }
+            catch (OperationCanceledException) when (_appLifetime.IsCancellationRequested)
+            {
+                _logger.Info("Engine restart cancelled during application shutdown.");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Unable to restart Stockfish.", ex);
+                UpdateUI($"Ошибка перезапуска Stockfish: {ex.Message}");
+            }
+        }
+
         private static string GetRussianPieceShort(char fenPiece) => char.ToUpper(fenPiece) switch
         {
             'P' => "П",
@@ -439,147 +492,12 @@ namespace ChGhost
             _ => "Фигура"
         };
 
-        private bool EnsureStockfishRunning()
-        {
-            lock (_sfLock)
-            {
-                if (_stockfish != null && !_stockfish.HasExited) return true;
-
-                KillStockfish();
-
-                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                string exePath = System.IO.Path.Combine(baseDir, "stockfish.exe");
-
-                if (!File.Exists(exePath))
-                {
-                    _debugInfo = $"Не найден файл: {exePath}";
-                    return false;
-                }
-
-                Process? candidate = null;
-                try
-                {
-                    candidate = new Process
-                    {
-                        StartInfo = new ProcessStartInfo
-                        {
-                            FileName = exePath,
-                            WorkingDirectory = baseDir,
-                            UseShellExecute = false,
-                            RedirectStandardInput = true,
-                            RedirectStandardOutput = true,
-                            CreateNoWindow = true
-                        }
-                    };
-
-                    candidate.OutputDataReceived += (_, args) =>
-                    {
-                        if (string.IsNullOrEmpty(args.Data)) return;
-                        var waiter = _sfWaiter;
-                        if (waiter != null && !string.IsNullOrEmpty(_sfExpectedPrefix) && args.Data.StartsWith(_sfExpectedPrefix))
-                        {
-                            waiter.TrySetResult(args.Data);
-                        }
-                    };
-
-                    candidate.Start();
-                    candidate.BeginOutputReadLine();
-                    candidate.StandardInput.AutoFlush = true;
-
-                    _sfExpectedPrefix = "readyok";
-                    _sfWaiter = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-                    candidate.StandardInput.WriteLine("uci");
-                    candidate.StandardInput.WriteLine($"setoption name Threads value {ENGINE_THREADS}");
-                    candidate.StandardInput.WriteLine($"setoption name Hash value {ENGINE_HASH_MB}");
-                    candidate.StandardInput.WriteLine("setoption name MultiPV value 1");
-                    candidate.StandardInput.WriteLine("setoption name Move Overhead value 15");
-
-                    if (_fullStrength)
-                    {
-                        candidate.StandardInput.WriteLine("setoption name UCI_LimitStrength value false");
-                    }
-                    else
-                    {
-                        candidate.StandardInput.WriteLine("setoption name UCI_LimitStrength value true");
-                        candidate.StandardInput.WriteLine($"setoption name UCI_Elo value {TARGET_ELO}");
-                    }
-
-                    candidate.StandardInput.WriteLine("ucinewgame");
-                    candidate.StandardInput.WriteLine("isready");
-
-                    if (_sfWaiter.Task.Wait(3500))
-                    {
-                        _sfExpectedPrefix = "";
-                        _stockfish = candidate;
-                        return true;
-                    }
-
-                    _debugInfo = "Stockfish не ответил readyok.";
-                    DisposeProcessSafely(candidate);
-                    return false;
-                }
-                catch (Exception ex)
-                {
-                    _debugInfo = $"Ошибка запуска: {ex.Message}";
-                    DisposeProcessSafely(candidate);
-                    return false;
-                }
-            }
-        }
-
-        private void SendUciNewGame()
-        {
-            lock (_sfLock)
-            {
-                if (_stockfish != null && !_stockfish.HasExited)
-                {
-                    try
-                    {
-                        _stockfish.StandardInput.WriteLine("ucinewgame");
-                    }
-                    catch { }
-                }
-            }
-        }
-
-        private void KillStockfish()
-        {
-            lock (_sfLock)
-            {
-                _sfExpectedPrefix = "";
-                _sfWaiter?.TrySetCanceled();
-                _sfWaiter = null;
-                DisposeProcessSafely(_stockfish);
-                _stockfish = null;
-            }
-        }
-
-        private static void DisposeProcessSafely(Process? proc)
-        {
-            if (proc == null) return;
-            try
-            {
-                if (!proc.HasExited)
-                {
-                    try { proc.StandardInput.Close(); } catch { }
-                    proc.Kill();
-                    proc.WaitForExit(1000);
-                }
-            }
-            catch { }
-            finally
-            {
-                try { proc.Dispose(); } catch { }
-            }
-        }
-
         private void UpdateUI(string? customStatus = null)
         {
             string sideText = _playAsBlack ? "ЧЁРНЫЕ" : "БЕЛЫЕ";
             string stateText = _isRunning ? "РАБОТАЕТ" : "ПАУЗА";
             string speedText = _isBlitzTurboMode ? "БЛИЦ" : "РАПИД";
-            string powerText = _fullStrength ? $"MAX • {ENGINE_THREADS}T" : TARGET_ELO.ToString();
+            string powerText = _settings.FullStrength ? $"MAX • {_settings.EffectiveEngineThreads}T" : _settings.TargetElo.ToString();
 
             HeaderText.Text = $"CHESS GHOST [П{_activeProfile}] • {sideText} • {stateText} • {speedText} ({powerText})";
             HeaderText.Foreground = _isRunning
@@ -589,6 +507,12 @@ namespace ChGhost
             if (customStatus != null)
             {
                 StatusText.Text = customStatus;
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(_startupWarning))
+            {
+                StatusText.Text = _startupWarning;
                 return;
             }
 
@@ -637,12 +561,21 @@ namespace ChGhost
         private void SaveConfig()
         {
             string cfgPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, GetActiveDbFileName());
-            SavedConfig cfg = _recognizer.ExportCalibration();
-            cfg.TopLeftX = _topLeft.X;
-            cfg.TopLeftY = _topLeft.Y;
-            cfg.BottomRightX = _bottomRight.X;
-            cfg.BottomRightY = _bottomRight.Y;
-            File.WriteAllText(cfgPath, JsonSerializer.Serialize(cfg));
+            try
+            {
+                SavedConfig cfg = _recognizer.ExportCalibration();
+                cfg.TopLeftX = _topLeft.X;
+                cfg.TopLeftY = _topLeft.Y;
+                cfg.BottomRightX = _bottomRight.X;
+                cfg.BottomRightY = _bottomRight.Y;
+                File.WriteAllText(cfgPath, JsonSerializer.Serialize(cfg));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            {
+                _logger.Error($"Unable to save profile '{cfgPath}'.", ex);
+                _startupWarning = "Не удалось сохранить профиль. Проверьте доступ к папке приложения.";
+                UpdateUI();
+            }
         }
 
         private void LoadConfig()
@@ -673,7 +606,11 @@ namespace ChGhost
                             return;
                     }
                 }
-                catch { }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
+                {
+                    _logger.Error($"Unable to load profile '{path}'.", ex);
+                    _startupWarning = "Файл профиля повреждён; используются настройки по умолчанию.";
+                }
             }
 
             string[] legacyNames = _activeProfile switch
@@ -705,7 +642,11 @@ namespace ChGhost
                         break;
                     }
                 }
-                catch { }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
+                {
+                    _logger.Error($"Unable to load legacy profile '{legacyPath}'.", ex);
+                    _startupWarning = "Файл конфигурации повреждён; используются настройки профиля по умолчанию.";
+                }
             }
         }
 
@@ -738,14 +679,11 @@ namespace ChGhost
             ClearGraphics();
             if (!HasValidBoardBounds()) return;
 
-            var source = PresentationSource.FromVisual(this);
-            double dpiX = source?.CompositionTarget?.TransformFromDevice.M11 ?? 1.0;
-            double dpiY = source?.CompositionTarget?.TransformFromDevice.M22 ?? 1.0;
-
-            double x = _topLeft.X * dpiX;
-            double y = _topLeft.Y * dpiY;
-            double w = (_bottomRight.X - _topLeft.X) * dpiX;
-            double h = (_bottomRight.Y - _topLeft.Y) * dpiY;
+            System.Windows.Rect board = GetBoardDipRect();
+            double x = board.X;
+            double y = board.Y;
+            double w = board.Width;
+            double h = board.Height;
 
             var gridBrush = new SolidColorBrush(System.Windows.Media.Color.FromArgb(140, 0, 255, 136));
 
@@ -777,6 +715,27 @@ namespace ChGhost
             }
         }
 
+        private System.Windows.Rect GetBoardDipRect()
+        {
+            System.Windows.Point topLeft = ScreenToOverlayDip(_topLeft);
+            System.Windows.Point bottomRight = ScreenToOverlayDip(_bottomRight);
+            return new System.Windows.Rect(topLeft, bottomRight);
+        }
+
+        private System.Windows.Point ScreenToOverlayDip(Point screenPoint)
+        {
+            PresentationSource? source = PresentationSource.FromVisual(this);
+            if (source?.CompositionTarget == null)
+                return new System.Windows.Point(screenPoint.X, screenPoint.Y);
+
+            IntPtr hwnd = new WindowInteropHelper(this).Handle;
+            System.Drawing.Rectangle windowBounds = Win32Interop.GetWindowRectangle(hwnd);
+            var clientPoint = new System.Windows.Point(
+                screenPoint.X - windowBounds.Left,
+                screenPoint.Y - windowBounds.Top);
+            return source.CompositionTarget.TransformFromDevice.Transform(clientPoint);
+        }
+
         private Bitmap CaptureBoard()
         {
             BoardRect bounds = _boardDetector.Detect() ?? throw new InvalidOperationException("Board bounds are not configured.");
@@ -792,26 +751,21 @@ namespace ChGhost
         {
             if (_isScanning || !HasValidBoardBounds() || !HasValidSignatures()) return;
 
-            if (!forceCalculate && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0)
+            if (!forceCalculate && Win32Interop.IsLeftMouseButtonDown())
                 return;
 
             _isScanning = true;
             bool playAsBlackSnap = _playAsBlack;
             try
             {
-                bool ready = await Task.Run(EnsureStockfishRunning);
-                if (!ready)
-                {
-                    UpdateUI(_debugInfo);
-                    return;
-                }
-
                 BoardRecognitionResult recognition = await Task.Run(() =>
                 {
                     using Bitmap bmp = CaptureBoard();
                     return _recognizer.Recognize(bmp, playAsBlackSnap);
                 });
 
+                _appLifetime.Token.ThrowIfCancellationRequested();
+                await _engine.EnsureRunningAsync(_appLifetime.Token);
                 TrackingUpdate tracking = _gameStateTracker.Update(recognition, forceCalculate, playAsBlackSnap);
                 if (tracking.IsDebounced)
                     return;
@@ -851,9 +805,9 @@ namespace ChGhost
 
                 char turn = playAsBlackSnap ? 'b' : 'w';
                 string fullFen = $"{tracking.StableFen} {turn} {tracking.CastlingRights} - 0 1";
-                int moveTimeMs = _isBlitzTurboMode ? 180 : 550;
+                int moveTimeMs = _isBlitzTurboMode ? _settings.MoveTimeBlitzMs : _settings.MoveTimeRapidMs;
 
-                string bestMove = await Task.Run(() => QueryStockfish(fullFen, moveTimeMs));
+                string bestMove = await _engine.GetBestMoveAsync(fullFen, moveTimeMs, _appLifetime.Token);
                 if (bestMove.Length >= 4)
                 {
                     _lastBestMove = bestMove;
@@ -885,51 +839,30 @@ namespace ChGhost
                         string promoSuffix = "";
                         if (bestMove.Length >= 5)
                             promoSuffix = $"={GetRussianPieceShort(bestMove[4])}";
-                        _lastMoveRussianText = $"{pieceRus} {fromSq} ? {toSq}{promoSuffix}";
+                        _lastMoveRussianText = $"{pieceRus} {fromSq} → {toSq}{promoSuffix}";
                     }
 
                     RedrawOverlay();
                     UpdateUI();
                 }
             }
+            catch (OperationCanceledException) when (_appLifetime.IsCancellationRequested)
+            {
+                _logger.Info("Board scan cancelled during application shutdown.");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Board scan or Stockfish operation failed.", ex);
+                _debugInfo = File.Exists(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "stockfish.exe"))
+                    ? $"Ошибка движка: {ex.Message}"
+                    : "Не найден stockfish.exe рядом с ChGhost.exe.";
+                UpdateUI(_debugInfo);
+            }
             finally
             {
                 _isScanning = false;
             }
         }
-        private string QueryStockfish(string fen, int moveTimeMs)
-        {
-            lock (_sfLock)
-            {
-                if (_stockfish == null || _stockfish.HasExited) return "";
-
-                try
-                {
-                    _sfExpectedPrefix = "bestmove";
-                    var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-                    _sfWaiter = tcs;
-
-                    _stockfish.StandardInput.WriteLine($"position fen {fen}");
-                    _stockfish.StandardInput.WriteLine($"go movetime {moveTimeMs}");
-
-                    if (tcs.Task.Wait(3500))
-                    {
-                        _sfExpectedPrefix = "";
-                        var parts = tcs.Task.Result.Split(' ');
-                        return parts.Length > 1 ? parts[1] : "";
-                    }
-
-                    KillStockfish();
-                    return "";
-                }
-                catch
-                {
-                    KillStockfish();
-                    return "";
-                }
-            }
-        }
-
         private void ClearGraphics()
         {
             for (int i = OverlayCanvas.Children.Count - 1; i >= 0; i--)
@@ -959,14 +892,11 @@ namespace ChGhost
         {
             if (!HasValidBoardBounds()) return;
 
-            var source = PresentationSource.FromVisual(this);
-            double dpiX = source?.CompositionTarget?.TransformFromDevice.M11 ?? 1.0;
-            double dpiY = source?.CompositionTarget?.TransformFromDevice.M22 ?? 1.0;
-
-            double cellW = ((_bottomRight.X - _topLeft.X) / 8.0) * dpiX;
-            double cellH = ((_bottomRight.Y - _topLeft.Y) / 8.0) * dpiY;
-            double startX = _topLeft.X * dpiX;
-            double startY = _topLeft.Y * dpiY;
+            System.Windows.Rect board = GetBoardDipRect();
+            double cellW = board.Width / 8.0;
+            double cellH = board.Height / 8.0;
+            double startX = board.X;
+            double startY = board.Y;
 
             for (int r = 0; r < 8; r++)
             {
@@ -1033,14 +963,11 @@ namespace ChGhost
                 c2 = 7 - c2; r2 = 7 - r2;
             }
 
-            var source = PresentationSource.FromVisual(this);
-            double dpiX = source?.CompositionTarget?.TransformFromDevice.M11 ?? 1.0;
-            double dpiY = source?.CompositionTarget?.TransformFromDevice.M22 ?? 1.0;
-
-            double cellW = ((_bottomRight.X - _topLeft.X) / 8.0) * dpiX;
-            double cellH = ((_bottomRight.Y - _topLeft.Y) / 8.0) * dpiY;
-            double startX = _topLeft.X * dpiX;
-            double startY = _topLeft.Y * dpiY;
+            System.Windows.Rect board = GetBoardDipRect();
+            double cellW = board.Width / 8.0;
+            double cellH = board.Height / 8.0;
+            double startX = board.X;
+            double startY = board.Y;
 
             double x1 = startX + (c1 + 0.5) * cellW;
             double y1 = startY + (r1 + 0.5) * cellH + offsetY;
@@ -1075,14 +1002,47 @@ namespace ChGhost
             OverlayCanvas.Children.Add(arrowHead);
         }
 
-        protected override void OnClosed(EventArgs e)
+        protected override async void OnClosing(CancelEventArgs e)
+        {
+            if (!_allowClose)
+            {
+                e.Cancel = true;
+                base.OnClosing(e);
+                if (_closing)
+                    return;
+
+                _closing = true;
+                _appLifetime.Cancel();
+                _scanTimer.Stop();
+                UnregisterHotKeys();
+                try
+                {
+                    await _engine.DisposeAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("Error while disposing chess engine during shutdown.", ex);
+                }
+                _appLifetime.Dispose();
+                _allowClose = true;
+                Close();
+                return;
+            }
+
+            base.OnClosing(e);
+        }
+
+        private void UnregisterHotKeys()
         {
             IntPtr hwnd = new WindowInteropHelper(this).Handle;
-            for (int i = 1; i <= 16; i++) UnregisterHotKey(hwnd, i);
-
-            _scanTimer.Stop();
-            KillStockfish();
-            base.OnClosed(e);
+            foreach (int id in _registeredHotkeys)
+            {
+                if (Win32Interop.TryUnregisterHotKey(hwnd, id, out int errorCode))
+                    continue;
+                if (errorCode != 0)
+                    _logger.Warn($"UnregisterHotKey failed for id {id}; Win32 error {errorCode}.");
+            }
+            _registeredHotkeys.Clear();
         }
     }
 }
