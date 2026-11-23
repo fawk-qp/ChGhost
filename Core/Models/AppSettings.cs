@@ -13,6 +13,8 @@ public sealed class AppSettings
     public int ScanIntervalBlitzMs { get; set; } = 220;
     public int ScanIntervalRapidMs { get; set; } = 450;
     public int CommandTimeoutMs { get; set; } = 3500;
+    public string RecognizerMode { get; set; } = "Auto";
+    public string OnnxModelPath { get; set; } = "models/pieces_64x64.onnx";
 
     [JsonIgnore]
     public int EffectiveEngineThreads => EngineThreads == 0
@@ -30,6 +32,8 @@ public sealed class AppSettings
         ScanIntervalBlitzMs = 220,
         ScanIntervalRapidMs = 450,
         CommandTimeoutMs = 3500
+        , RecognizerMode = "Auto"
+        , OnnxModelPath = "models/pieces_64x64.onnx"
     };
 
     public AppSettings Normalize()
@@ -42,6 +46,15 @@ public sealed class AppSettings
         ScanIntervalBlitzMs = Math.Clamp(ScanIntervalBlitzMs, 50, 10_000);
         ScanIntervalRapidMs = Math.Clamp(ScanIntervalRapidMs, 50, 10_000);
         CommandTimeoutMs = Math.Clamp(CommandTimeoutMs, 250, 60_000);
+        RecognizerMode = RecognizerMode?.Trim().ToLowerInvariant() switch
+        {
+            "onnx" => "Onnx",
+            "template" => "Template",
+            _ => "Auto"
+        };
+        OnnxModelPath = string.IsNullOrWhiteSpace(OnnxModelPath)
+            ? "models/pieces_64x64.onnx"
+            : OnnxModelPath.Trim();
         return this;
     }
 }

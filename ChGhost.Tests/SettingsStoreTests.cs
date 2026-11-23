@@ -21,6 +21,8 @@ public class SettingsStoreTests
         Assert.InRange(settings.EffectiveEngineThreads, 1, 16);
         Assert.Equal(512, settings.EngineHashMb);
         Assert.Equal(2600, settings.TargetElo);
+        Assert.Equal("Auto", settings.RecognizerMode);
+        Assert.Equal("models/pieces_64x64.onnx", settings.OnnxModelPath);
     }
 
     [Fact]
@@ -108,6 +110,32 @@ public class SettingsStoreTests
 
         Assert.Equal(Math.Clamp(Environment.ProcessorCount - 2, 1, 16), settings.EffectiveEngineThreads);
         Assert.Equal(0, settings.EngineThreads);
+    }
+
+    [Theory]
+    [InlineData("auto", "Auto")]
+    [InlineData("ONNX", "Onnx")]
+    [InlineData(" Template ", "Template")]
+    [InlineData("unknown", "Auto")]
+    public void RecognizerModeIsNormalizedCaseInsensitively(string configured, string expected)
+    {
+        var settings = AppSettings.CreateDefaults();
+        settings.RecognizerMode = configured;
+
+        settings.Normalize();
+
+        Assert.Equal(expected, settings.RecognizerMode);
+    }
+
+    [Fact]
+    public void OnnxModelPathFallsBackWhenBlank()
+    {
+        var settings = AppSettings.CreateDefaults();
+        settings.OnnxModelPath = " ";
+
+        settings.Normalize();
+
+        Assert.Equal("models/pieces_64x64.onnx", settings.OnnxModelPath);
     }
 
     [Theory]

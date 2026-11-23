@@ -20,6 +20,7 @@ using ChGhost.Core.Models;
 using ChGhost.Core.Native;
 using ChGhost.Core.Tracking;
 using ChGhost.Core.Vision;
+using Microsoft.ML.OnnxRuntime;
 using Color = System.Drawing.Color;
 using Point = System.Drawing.Point;
 
@@ -35,7 +36,7 @@ namespace ChGhost
         private readonly IChessEngine _engine;
         private readonly CancellationTokenSource _appLifetime = new();
         private int _activeProfile = 1;
-        private readonly ICalibratableRecognizer _recognizer = new TemplateRecognizer();
+        private readonly IBoardRecognizer _recognizer;
         private readonly IBoardDetector _boardDetector = new ManualBoardDetector();
         private readonly GameStateTracker _gameStateTracker = new();
 
@@ -84,6 +85,7 @@ namespace ChGhost
             _logger = new FileAppLogger();
             _settingsStore = new SettingsStore(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json"), _logger);
             _settings = _settingsStore.Load();
+            _recognizer = CreateRecognizer();
             _engine = new StockfishEngine(
                 System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "stockfish.exe"),
                 _settings,
@@ -94,6 +96,27 @@ namespace ChGhost
             ApplySpeedPreset();
             _scanTimer.Tick += async (_, _) => await ScanAndSuggestAsync();
         }
+
+        private IBoardRecognizer CreateRecognizer()
+        {
+            if (_settings.RecognizerMode == "Template")
+                return new TemplateRecognizer();
+
+            try
+            {
+                string modelPath = _settings.OnnxModelPath;
+                if (!System.IO.Path.IsPathRooted(modelPath))
+                    modelPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, modelPath);
+                return new OnnxBoardRecognizer(modelPath, _logger);
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or InvalidOperationException or OnnxRuntimeException)
+            {
+                _logger.Warn($"ONNX recognizer could not be initialized: {ex.Message}. Falling back to TemplateRecognizer.");
+                return new TemplateRecognizer();
+            }
+        }
+
+        private ICalibratableRecognizer? CalibratableRecognizer => _recognizer as ICalibratableRecognizer;
 
         private string GetActiveDbFileName() => $"board_auto_v13_p{_activeProfile}.json";
 
@@ -276,7 +299,7 @@ namespace ChGhost
         {
             _activeProfile = (_activeProfile % PROFILE_COUNT) + 1;
             _boardDetector.Reset();
-            _recognizer.ResetCalibration();
+            CalibratableRecognizer?.ResetCalibration();
             ResetBoardTracking();
             ClearGraphics();
             LoadConfig();
@@ -310,7 +333,8 @@ namespace ChGhost
                 && bounds.Value.IsValid;
         }
 
-        private bool HasValidSignatures() => _recognizer.IsReady;
+        private bool HasValidSignatures() =>
+            CalibratableRecognizer?.IsReady ?? _recognizer.IsReady;
 
         private void SmartAlt3Action()
         {
@@ -320,11 +344,27 @@ namespace ChGhost
                 return;
             }
 
+            if (CalibratableRecognizer == null)
+            {
+                ResetBoardTracking();
+                ClearGraphics();
+                if (!_isRunning)
+                {
+                    _isRunning = true;
+                    _scanTimer.Start();
+                }
+                UpdateUI("[AI] Полный пересчёт позиции с чистого листа -> считаю ход...");
+                _ = ScanAndSuggestAsync(forceCalculate: true);
+                return;
+            }
+
             if (!HasValidSignatures())
                 LoadConfig();
 
             using Bitmap boardBmp = CaptureBoard();
-            CalibrationOutcome calibration = _recognizer.CalibrateStartingPosition(boardBmp, _playAsBlack);
+            ICalibratableRecognizer calibratable = CalibratableRecognizer
+                ?? throw new InvalidOperationException("Template calibratable recognizer is unavailable.");
+            CalibrationOutcome calibration = calibratable.CalibrateStartingPosition(boardBmp, _playAsBlack);
             if (calibration.IsStartingPosition)
             {
                 _playAsBlack = calibration.PlayAsBlack;
@@ -365,6 +405,13 @@ namespace ChGhost
 
         private void ManualFixPieceAtCursor(Point cursor)
         {
+            ICalibratableRecognizer? calibratable = CalibratableRecognizer;
+            if (calibratable == null)
+            {
+                UpdateUI("[AI] Ручная запись эталонов не требуется; распознавание выполняется ONNX-моделью.");
+                return;
+            }
+
             if (!HasValidBoardBounds())
             {
                 UpdateUI("Сначала задайте углы доски (Alt+1 и Alt+2)!");
@@ -388,14 +435,14 @@ namespace ChGhost
             string savedName = _manualFixOrder[_fixIndex].name;
 
             using Bitmap boardBmp = CaptureBoard();
-            _recognizer.CalibratePiece(boardBmp, new Square(row, col), ToPieceClass(targetFen));
+            calibratable.CalibratePiece(boardBmp, new Square(row, col), ToPieceClass(targetFen));
             SaveConfig();
 
             _fixIndex = (_fixIndex + 1) % _manualFixOrder.Length;
 
             if (!HasValidSignatures())
             {
-                UpdateUI($"Записано: [{savedName}] ({_recognizer.CalibrationClassCount}/12). Далее: [{_manualFixOrder[_fixIndex].name}] -> Alt+F");
+                UpdateUI($"Записано: [{savedName}] ({calibratable.CalibrationClassCount}/12). Далее: [{_manualFixOrder[_fixIndex].name}] -> Alt+F");
             }
             else
             {
@@ -499,7 +546,8 @@ namespace ChGhost
             string speedText = _isBlitzTurboMode ? "БЛИЦ" : "РАПИД";
             string powerText = _settings.FullStrength ? $"MAX • {_settings.EffectiveEngineThreads}T" : _settings.TargetElo.ToString();
 
-            HeaderText.Text = $"CHESS GHOST [П{_activeProfile}] • {sideText} • {stateText} • {speedText} ({powerText})";
+            string recognizerText = CalibratableRecognizer == null ? "[AI]" : $"[П{_activeProfile}]";
+            HeaderText.Text = $"CHESS GHOST {recognizerText} • {sideText} • {stateText} • {speedText} ({powerText})";
             HeaderText.Foreground = _isRunning
                 ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(0, 255, 136))
                 : new SolidColorBrush(System.Windows.Media.Color.FromRgb(255, 200, 60));
@@ -547,7 +595,7 @@ namespace ChGhost
         {
             _isRunning = false;
             _scanTimer.Stop();
-            _recognizer.ResetCalibration();
+            CalibratableRecognizer?.ResetCalibration();
             _fixIndex = 0;
             _boardDetector.Reset();
             ResetBoardTracking();
@@ -560,10 +608,16 @@ namespace ChGhost
 
         private void SaveConfig()
         {
+            ICalibratableRecognizer? calibratable = CalibratableRecognizer;
+            if (calibratable == null)
+            {
+                SaveBoardBounds();
+                return;
+            }
             string cfgPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, GetActiveDbFileName());
             try
             {
-                SavedConfig cfg = _recognizer.ExportCalibration();
+                SavedConfig cfg = calibratable.ExportCalibration();
                 cfg.TopLeftX = _topLeft.X;
                 cfg.TopLeftY = _topLeft.Y;
                 cfg.BottomRightX = _bottomRight.X;
@@ -574,6 +628,28 @@ namespace ChGhost
             {
                 _logger.Error($"Unable to save profile '{cfgPath}'.", ex);
                 _startupWarning = "Не удалось сохранить профиль. Проверьте доступ к папке приложения.";
+                UpdateUI();
+            }
+        }
+
+        private void SaveBoardBounds()
+        {
+            string cfgPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, GetActiveDbFileName());
+            try
+            {
+                SavedConfig cfg = new SavedConfig
+                {
+                    TopLeftX = _topLeft.X,
+                    TopLeftY = _topLeft.Y,
+                    BottomRightX = _bottomRight.X,
+                    BottomRightY = _bottomRight.Y
+                };
+                File.WriteAllText(cfgPath, JsonSerializer.Serialize(cfg));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            {
+                _logger.Error($"Unable to save board bounds '{cfgPath}'.", ex);
+                _startupWarning = "Не удалось сохранить границы доски. Проверьте доступ к папке приложения.";
                 UpdateUI();
             }
         }
@@ -599,7 +675,8 @@ namespace ChGhost
                     var cfg = JsonSerializer.Deserialize<SavedConfig>(File.ReadAllText(path));
                     if (cfg != null)
                     {
-                        _recognizer.ImportCalibration(cfg);
+                        if (CalibratableRecognizer is { } calibratable)
+                            calibratable.ImportCalibration(cfg);
                         _topLeft = new Point(cfg.TopLeftX, cfg.TopLeftY);
                         _bottomRight = new Point(cfg.BottomRightX, cfg.BottomRightY);
                         if (HasValidSignatures())
@@ -654,7 +731,9 @@ namespace ChGhost
         {
             if (!HasValidBoardBounds() || !HasValidSignatures())
             {
-                UpdateUI($"[П{_activeProfile}] Сначала задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте партии!");
+                UpdateUI(CalibratableRecognizer == null
+                    ? "[AI] Сначала задайте углы доски (Alt+1 и Alt+2), затем Alt+3."
+                    : $"[П{_activeProfile}] Сначала задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте партии!");
                 return;
             }
 
@@ -1022,6 +1101,17 @@ namespace ChGhost
                 catch (Exception ex)
                 {
                     _logger.Error("Error while disposing chess engine during shutdown.", ex);
+                }
+                if (_recognizer is IDisposable disposableRecognizer)
+                {
+                    try
+                    {
+                        disposableRecognizer.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error("Error while disposing board recognizer during shutdown.", ex);
+                    }
                 }
                 _appLifetime.Dispose();
                 _allowClose = true;
