@@ -14,6 +14,10 @@ public static class Win32Interop
     public const uint ModAlt = 0x0001;
     public const uint ModNoRepeat = 0x4000;
     public const int VkLButton = 0x01;
+    private const int SM_XVIRTUALSCREEN = 76;
+    private const int SM_YVIRTUALSCREEN = 77;
+    private const int SM_CXVIRTUALSCREEN = 78;
+    private const int SM_CYVIRTUALSCREEN = 79;
 
     public static bool TrySetWindowDisplayAffinity(IntPtr window, uint affinity, out int errorCode)
     {
@@ -70,6 +74,15 @@ public static class Win32Interop
         return Rectangle.FromLTRB(rectangle.Left, rectangle.Top, rectangle.Right, rectangle.Bottom);
     }
 
+    public static Rectangle GetVirtualScreenBounds()
+    {
+        int x = NativeMethods.GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int y = NativeMethods.GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int width = NativeMethods.GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int height = NativeMethods.GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        return width > 0 && height > 0 ? new Rectangle(x, y, width, height) : Rectangle.Empty;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeRect
     {
@@ -109,5 +122,8 @@ public static class Win32Interop
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool GetWindowRect(IntPtr window, out NativeRect rectangle);
+
+        [DllImport("user32.dll")]
+        internal static extern int GetSystemMetrics(int nIndex);
     }
 }

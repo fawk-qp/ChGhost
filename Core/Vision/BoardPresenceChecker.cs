@@ -3,7 +3,7 @@ namespace ChGhost.Core.Vision;
 public static class BoardPresenceChecker
 {
     private const int TileSize = 64;
-    private const int Margin = 2;
+    private const int Margin = 4;
     private const double MinParityRgbDistance = 16.0;
     private const int MinMatchingSquares = 46;
 
@@ -41,9 +41,9 @@ public static class BoardPresenceChecker
                 int p2 = yBot * stride + xLeft * 3;
                 int p3 = yBot * stride + xRight * 3;
 
-                int b = (bgr24Buffer[p0] + bgr24Buffer[p1] + bgr24Buffer[p2] + bgr24Buffer[p3]) >> 2;
-                int g = (bgr24Buffer[p0 + 1] + bgr24Buffer[p1 + 1] + bgr24Buffer[p2 + 1] + bgr24Buffer[p3 + 1]) >> 2;
-                int r = (bgr24Buffer[p0 + 2] + bgr24Buffer[p1 + 2] + bgr24Buffer[p2 + 2] + bgr24Buffer[p3 + 2]) >> 2;
+                int b = TrimmedMean4(bgr24Buffer[p0], bgr24Buffer[p1], bgr24Buffer[p2], bgr24Buffer[p3]);
+                int g = TrimmedMean4(bgr24Buffer[p0 + 1], bgr24Buffer[p1 + 1], bgr24Buffer[p2 + 1], bgr24Buffer[p3 + 1]);
+                int r = TrimmedMean4(bgr24Buffer[p0 + 2], bgr24Buffer[p1 + 2], bgr24Buffer[p2 + 2], bgr24Buffer[p3 + 2]);
 
                 int idx = (sr << 3) | sc;
                 tileR[idx] = r;
@@ -99,6 +99,13 @@ public static class BoardPresenceChecker
         }
 
         return matching >= MinMatchingSquares;
+    }
+
+    private static int TrimmedMean4(int a, int b, int c, int d)
+    {
+        int min = Math.Min(Math.Min(a, b), Math.Min(c, d));
+        int max = Math.Max(Math.Max(a, b), Math.Max(c, d));
+        return (a + b + c + d - min - max) >> 1;
     }
 
     private static int DistSq(int r1, int g1, int b1, int r2, int g2, int b2)

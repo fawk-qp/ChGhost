@@ -27,6 +27,8 @@ public static class FenLegalityValidator
         int wkR = -1, wkC = -1, bkR = -1, bkC = -1;
         int wpCount = 0, bpCount = 0;
         int wTotal = 0, bTotal = 0;
+        int wQ = 0, wR = 0, wB = 0, wN = 0;
+        int bQ = 0, bR = 0, bB = 0, bN = 0;
 
         for (int r = 0; r < 8; r++)
         {
@@ -52,6 +54,14 @@ public static class FenLegalityValidator
                             return (false, $"Чёрная пешка на недопустимой горизонтали (r={r}).");
                         bpCount++;
                         break;
+                    case 'Q': wQ++; break;
+                    case 'q': bQ++; break;
+                    case 'R': wR++; break;
+                    case 'r': bR++; break;
+                    case 'B': wB++; break;
+                    case 'b': bB++; break;
+                    case 'N': wN++; break;
+                    case 'n': bN++; break;
                 }
             }
         }
@@ -61,6 +71,13 @@ public static class FenLegalityValidator
 
         if (wpCount > 8 || bpCount > 8 || wTotal > 16 || bTotal > 16)
             return (false, $"Превышен лимит фигур (Б={wTotal}/пешек={wpCount}, Ч={bTotal}/пешек={bpCount}).");
+
+        int extraWhite = Math.Max(0, wQ - 1) + Math.Max(0, wR - 2) + Math.Max(0, wB - 2) + Math.Max(0, wN - 2);
+        int extraBlack = Math.Max(0, bQ - 1) + Math.Max(0, bR - 2) + Math.Max(0, bB - 2) + Math.Max(0, bN - 2);
+        if (wpCount + extraWhite > 8)
+            return (false, $"Превышен бюджет превращений белых (пешек={wpCount}, лишних фигур={extraWhite}).");
+        if (bpCount + extraBlack > 8)
+            return (false, $"Превышен бюджет превращений чёрных (пешек={bpCount}, лишних фигур={extraBlack}).");
 
         if (Math.Abs(wkR - bkR) <= 1 && Math.Abs(wkC - bkC) <= 1)
             return (false, "Короли находятся на соседних клетках.");

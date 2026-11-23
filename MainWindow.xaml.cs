@@ -38,6 +38,7 @@ namespace ChGhost
         private int _activeProfile = 1;
         private readonly IBoardRecognizer _recognizer;
         private readonly IBoardDetector _boardDetector = new ManualBoardDetector();
+        private readonly AutoBoardDetector _autoBoardDetector;
         private readonly GameStateTracker _gameStateTracker = new();
 
         private readonly (char fen, string name)[] _manualFixOrder =
@@ -86,6 +87,7 @@ namespace ChGhost
         public MainWindow()
         {
             _logger = new FileAppLogger();
+            _autoBoardDetector = new AutoBoardDetector(_logger, CaptureVirtualScreen);
             _settingsStore = new SettingsStore(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json"), _logger);
             _settings = _settingsStore.Load();
             _recognizer = CreateRecognizer();
@@ -232,8 +234,15 @@ namespace ChGhost
                         break;
 
                     case 4:
-                        _fixIndex = (_fixIndex + 1) % _manualFixOrder.Length;
-                        UpdateUI($"Ручная правка ({_fixIndex + 1}/12): [{_manualFixOrder[_fixIndex].name}] -> наведите и Alt+F");
+                        if (CalibratableRecognizer == null)
+                        {
+                            UpdateUI("[AI] Ручная калибровка не нужна; авто-поиск доски: Alt+F");
+                        }
+                        else
+                        {
+                            _fixIndex = (_fixIndex + 1) % _manualFixOrder.Length;
+                            UpdateUI($"Ручная правка ({_fixIndex + 1}/12): [{_manualFixOrder[_fixIndex].name}] -> наведите и Alt+F");
+                        }
                         break;
 
                     case 5:
@@ -274,7 +283,10 @@ namespace ChGhost
                         break;
 
                     case 12:
-                        ManualFixPieceAtCursor(cursor);
+                        if (CalibratableRecognizer == null || !HasValidBoardBounds())
+                            TryAutoDetectBoard();
+                        else
+                            ManualFixPieceAtCursor(cursor);
                         break;
 
                     case 14:
@@ -349,12 +361,59 @@ namespace ChGhost
         private bool HasValidSignatures() =>
             CalibratableRecognizer?.IsReady ?? _recognizer.IsReady;
 
+        private bool TryAutoDetectBoard(bool triggerScanAfter = true)
+        {
+            BoardDetectionDiagnostics diag = _autoBoardDetector.DetectWithDiagnostics();
+            if (diag.Rect is not { } rect)
+            {
+                _logger.Warn("Auto board detection did not find a chessboard.");
+                UpdateUI("Доска не найдена на экране (Alt+1 / Alt+2 вручную)");
+                return false;
+            }
+
+            _topLeft = new Point(rect.Left, rect.Top);
+            _bottomRight = new Point(rect.Right, rect.Bottom);
+            SaveConfig();
+
+            if (_recognizer is OnnxBoardRecognizer onnxRec)
+            {
+                try
+                {
+                    onnxRec.InvalidateCache();
+                    using Bitmap boardBmp = CaptureBoard();
+                    BoardRecognitionResult recognition = onnxRec.Recognize(boardBmp, _playAsBlack);
+                    bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlack(recognition.RawGrid, _playAsBlack);
+                    if (detected.HasValue)
+                        _playAsBlack = detected.Value;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("ONNX side auto-detection after board autodetect failed.", ex);
+                }
+            }
+
+            ResetBoardTracking();
+            DrawCalibrationGrid();
+
+            _logger.Info($"[AUTODETECT] Board found: {rect.Left},{rect.Top} -> {rect.Right},{rect.Bottom} ({rect.Width}x{rect.Height}) | corners={diag.MatchedCorners}/49 | parity={diag.ParitySquares}/64 | ms={diag.ElapsedMs:F1}");
+            UpdateUI($"Доска найдена автоматически ({rect.Width}x{rect.Height})");
+            if (triggerScanAfter)
+                _ = ScanAndSuggestAsync(forceCalculate: true);
+            return true;
+        }
+
         private void SmartAlt3Action()
         {
-            if (!HasValidBoardBounds())
+            bool boardOccluded = _recognizer is OnnxBoardRecognizer onnx && !onnx.LastBoardVisible;
+            if (!HasValidBoardBounds() || boardOccluded)
             {
-                UpdateUI("Сначала задайте углы доски: Alt+1 (верх-лево) и Alt+2 (низ-право)!");
-                return;
+                if (TryAutoDetectBoard(triggerScanAfter: true))
+                    return;
+                if (!HasValidBoardBounds())
+                {
+                    UpdateUI("Сначала задайте углы доски: Alt+1 (верх-лево) и Alt+2 (низ-право)!");
+                    return;
+                }
             }
 
             if (CalibratableRecognizer == null)
@@ -611,7 +670,7 @@ namespace ChGhost
 
             if (!HasValidBoardBounds())
             {
-                StatusText.Text = $"[П{_activeProfile}] 1. Угол A8 -> Alt+1 | 2. Угол H1 -> Alt+2 | Alt+P: профиль (1-3)";
+                StatusText.Text = $"[П{_activeProfile}] 1. Alt+F: авто | 2. Угол A8 -> Alt+1 | Угол H1 -> Alt+2 | Alt+P: профиль";
                 return;
             }
 
@@ -777,8 +836,8 @@ namespace ChGhost
             if (!HasValidBoardBounds() || !HasValidSignatures())
             {
                 UpdateUI(CalibratableRecognizer == null
-                    ? "[AI] Сначала задайте углы доски (Alt+1 и Alt+2), затем Alt+3."
-                    : $"[П{_activeProfile}] Сначала задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте партии!");
+                    ? "[AI] Сначала найдите доску (Alt+F) или задайте углы (Alt+1 и Alt+2), затем Alt+3."
+                    : $"[П{_activeProfile}] Сначала найдите доску (Alt+F) или задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте партии!");
                 return;
             }
 
@@ -858,6 +917,18 @@ namespace ChGhost
                 screenPoint.X - windowBounds.Left,
                 screenPoint.Y - windowBounds.Top);
             return source.CompositionTarget.TransformFromDevice.Transform(clientPoint);
+        }
+
+        private (Bitmap Screen, int OffsetX, int OffsetY) CaptureVirtualScreen()
+        {
+            System.Drawing.Rectangle bounds = Win32Interop.GetVirtualScreenBounds();
+            if (bounds.IsEmpty)
+                bounds = new System.Drawing.Rectangle(0, 0, 1, 1);
+
+            var bmp = new Bitmap(bounds.Width, bounds.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            using Graphics g = Graphics.FromImage(bmp);
+            g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, bounds.Size);
+            return (bmp, bounds.X, bounds.Y);
         }
 
         private Bitmap CaptureBoard()
