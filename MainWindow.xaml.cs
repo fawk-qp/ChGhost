@@ -92,6 +92,7 @@ namespace ChGhost
                 _logger);
             InitializeComponent();
             LoadConfig();
+            UpdateUI();
 
             ApplySpeedPreset();
             _scanTimer.Tick += async (_, _) => await ScanAndSuggestAsync();

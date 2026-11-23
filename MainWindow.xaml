@@ -15,7 +15,7 @@
             <StackPanel>
                 <TextBlock x:Name="HeaderText" Foreground="#00FF88"
                            FontFamily="Consolas" FontSize="14" FontWeight="Bold"
-                           Text="CHESS GHOST • БЕЛЫЕ • ПАУЗА"/>
+                           Text="CHESS GHOST [AI] • БЕЛЫЕ • ПАУЗА"/>
                 <TextBlock x:Name="StatusText" Foreground="#FFFFFF"
                            FontFamily="Consolas" FontSize="13" Margin="0,4,0,6"
                            Text="1. Угол A8 -> Alt+1 | 2. Угол H1 -> Alt+2"/>
