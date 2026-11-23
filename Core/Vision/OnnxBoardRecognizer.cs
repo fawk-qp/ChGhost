@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -20,6 +21,11 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
     private const int SampleFloatLength = 3 * PlaneLength;
     private const float InvHalfByte = 1.0f / 127.5f;
 
+    // Порог среднего отличия пикселя (0..255) на клетке 64x64.
+    // Сетка/антиалиасинг и сжатие дают < 1.0, движение фигуры или подсветка > 5.0.
+    private const double DirtyTileMadThreshold = 2.6;
+    private const int PeriodicFullRefreshTicks = 40;
+
     private static readonly char[] ClassToFen =
     {
         '1',
@@ -32,7 +38,14 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
     private readonly string _inputName;
     private readonly string _outputName;
     private readonly float[] _tensorBuffer = new float[64 * SampleFloatLength];
+    private readonly double[,,] _cachedScreenProbs = new double[8, 8, NumClasses];
+    private readonly int[] _dirtyTiles = new int[64];
+
     private byte[] _pixelBuffer = Array.Empty<byte>();
+    private byte[] _prevPixelBuffer = Array.Empty<byte>();
+    private int _prevStride;
+    private bool _hasCache;
+    private int _ticksSinceFullRefresh;
     private bool _disposed;
 
     public OnnxBoardRecognizer(string modelPath, IAppLogger? logger = null)
@@ -57,8 +70,67 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
     }
 
     public string EngineName => "OnnxBoardRecognizer";
-
     public bool IsReady => !_disposed;
+    public double LastInferenceMs { get; private set; }
+    public int LastDirtySquareCount { get; private set; }
+
+    public void InvalidateCache()
+    {
+        lock (_inferLock)
+        {
+            _hasCache = false;
+            _ticksSinceFullRefresh = 0;
+        }
+    }
+
+    /// <summary>
+    /// Автоматически определяет сторону (true = чёрные снизу), сравнивая
+    /// распределение белых и чёрных фигур по верхней и нижней половинам доски.
+    /// Возвращает null, если позиция слишком симметрична/пуста для уверенного вывода.
+    /// </summary>
+    public static bool? TryDetectPlayAsBlack(char[,] boardGrid, bool currentPlayAsBlack)
+    {
+        double whiteScreenRowSum = 0, blackScreenRowSum = 0;
+        int whiteCount = 0, blackCount = 0;
+
+        for (int sr = 0; sr < 8; sr++)
+        {
+            for (int sc = 0; sc < 8; sc++)
+            {
+                int br = currentPlayAsBlack ? 7 - sr : sr;
+                int bc = currentPlayAsBlack ? 7 - sc : sc;
+                char p = boardGrid[br, bc];
+                if (p == '1') continue;
+
+                // Короли и пешки дают самый сильный сигнал стороны
+                double weight = (char.ToUpperInvariant(p) == 'K') ? 3.0
+                    : (char.ToUpperInvariant(p) == 'P') ? 1.5
+                    : 1.0;
+
+                if (char.IsUpper(p))
+                {
+                    whiteScreenRowSum += sr * weight;
+                    whiteCount += (int)Math.Round(weight);
+                }
+                else
+                {
+                    blackScreenRowSum += sr * weight;
+                    blackCount += (int)Math.Round(weight);
+                }
+            }
+        }
+
+        if (whiteCount < 4 || blackCount < 4)
+            return null;
+
+        double whiteAvgRow = whiteScreenRowSum / whiteCount;
+        double blackAvgRow = blackScreenRowSum / blackCount;
+
+        // Если средние ряды разнесены хотя бы на 1.5 горизонтали — ориентация надёжна
+        if (blackAvgRow - whiteAvgRow >= 1.5) return true;   // Чёрные внизу (sr ближе к 7)
+        if (whiteAvgRow - blackAvgRow >= 1.5) return false;  // Белые внизу (sr ближе к 7)
+        return null;
+    }
 
     public BoardRecognitionResult Recognize(Bitmap board, bool playAsBlack)
     {
@@ -69,64 +141,63 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            FillInputTensor(board);
+            var sw = Stopwatch.StartNew();
+            int stride = CaptureResizedPixels(board);
 
-            var inputTensor = new DenseTensor<float>(_tensorBuffer, new[] { 64, 3, TileSize, TileSize });
-            var inputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, inputTensor) };
+            bool forceFull = !_hasCache
+                || _prevStride != stride
+                || _prevPixelBuffer.Length != _pixelBuffer.Length
+                || _ticksSinceFullRefresh >= PeriodicFullRefreshTicks;
 
-            using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> outputs = _session.Run(inputs);
-            Tensor<float> logitsTensor = outputs.First(v => v.Name == _outputName).AsTensor<float>();
+            int dirtyCount = CollectDirtyTiles(stride, forceFull);
+            LastDirtySquareCount = dirtyCount;
 
-            char[,] grid = new char[8, 8];
-            double[,,] classScores = new double[8, 8, NumClasses];
-            double[,] confidences = new double[8, 8];
-            var activeCells = new List<(int Row, int Col, double Score)>(32);
-
-            Span<double> probs = stackalloc double[NumClasses];
-
-            for (int sr = 0; sr < 8; sr++)
+            if (dirtyCount > 0)
             {
-                for (int sc = 0; sc < 8; sc++)
+                PackDirtyTilesToTensor(stride, dirtyCount);
+
+                int floatCount = dirtyCount * SampleFloatLength;
+                var inputTensor = new DenseTensor<float>(
+                    _tensorBuffer.AsMemory(0, floatCount),
+                    new[] { dirtyCount, 3, TileSize, TileSize });
+
+                var inputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, inputTensor) };
+                using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> outputs = _session.Run(inputs);
+                Tensor<float> logitsTensor = outputs.First(v => v.Name == _outputName).AsTensor<float>();
+
+                Span<double> probs = stackalloc double[NumClasses];
+                for (int i = 0; i < dirtyCount; i++)
                 {
-                    int batchIdx = sr * 8 + sc;
-                    int boardR = playAsBlack ? 7 - sr : sr;
-                    int boardC = playAsBlack ? 7 - sc : sc;
+                    int tileIdx = _dirtyTiles[i];
+                    int sr = tileIdx >> 3;
+                    int sc = tileIdx & 7;
 
-                    ComputeSoftmax(logitsTensor, batchIdx, probs);
-
-                    int bestClass = 0;
-                    double bestProb = probs[0];
+                    ComputeSoftmax(logitsTensor, i, probs);
                     for (int k = 0; k < NumClasses; k++)
-                    {
-                        classScores[boardR, boardC, k] = probs[k];
-                        if (probs[k] > bestProb)
-                        {
-                            bestProb = probs[k];
-                            bestClass = k;
-                        }
-                    }
-
-                    char piece = ClassToFen[bestClass];
-                    grid[boardR, boardC] = piece;
-                    confidences[boardR, boardC] = bestClass == 0 ? 0.0 : bestProb;
-
-                    if (piece != '1')
-                        activeCells.Add((boardR, boardC, bestProb));
+                        _cachedScreenProbs[sr, sc, k] = probs[k];
                 }
-            }
 
-            if (activeCells.Count > 32)
+                // Сохраняем текущий буфер пикселей как эталон для следующего кадра
+                if (_prevPixelBuffer.Length != _pixelBuffer.Length)
+                    _prevPixelBuffer = new byte[_pixelBuffer.Length];
+                Buffer.BlockCopy(_pixelBuffer, 0, _prevPixelBuffer, 0, _pixelBuffer.Length);
+                _prevStride = stride;
+                _hasCache = true;
+                _ticksSinceFullRefresh = forceFull ? 0 : _ticksSinceFullRefresh + 1;
+            }
+            else
             {
-                var toDrop = activeCells.OrderBy(x => x.Score).Take(activeCells.Count - 32);
-                foreach (var item in toDrop)
-                    grid[item.Row, item.Col] = '1';
+                _ticksSinceFullRefresh++;
             }
 
-            return new BoardRecognitionResult(grid, classScores, confidences, GridToFen(grid));
+            sw.Stop();
+            LastInferenceMs = sw.Elapsed.TotalMilliseconds;
+
+            return BuildResultFromCache(playAsBlack);
         }
     }
 
-    private void FillInputTensor(Bitmap sourceBoard)
+    private int CaptureResizedPixels(Bitmap sourceBoard)
     {
         using var resized = new Bitmap(BoardRenderSize, BoardRenderSize, PixelFormat.Format24bppRgb);
         using (Graphics g = Graphics.FromImage(resized))
@@ -147,7 +218,7 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
 
         int stride = bmpData.Stride;
         int totalBytes = stride * BoardRenderSize;
-        if (_pixelBuffer.Length < totalBytes)
+        if (_pixelBuffer.Length != totalBytes)
             _pixelBuffer = new byte[totalBytes];
 
         try
@@ -159,38 +230,134 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             resized.UnlockBits(bmpData);
         }
 
+        return stride;
+    }
+
+    private int CollectDirtyTiles(int stride, bool forceFull)
+    {
+        int count = 0;
+        if (forceFull)
+        {
+            for (int i = 0; i < 64; i++)
+                _dirtyTiles[count++] = i;
+            return count;
+        }
+
+        // Проверяем каждый 2-й пиксель по X и Y (1024 точки на клетку) — < 0.4 мс на всю доску
+        const int sampledChannels = (TileSize / 2) * (TileSize / 2) * 3;
+        long thresholdSum = (long)(DirtyTileMadThreshold * sampledChannels);
+
         for (int sr = 0; sr < 8; sr++)
         {
             int yBase = sr * TileSize;
             for (int sc = 0; sc < 8; sc++)
             {
                 int xBase = sc * TileSize;
-                int sampleOffset = (sr * 8 + sc) * SampleFloatLength;
-                int rOffset = sampleOffset;
-                int gOffset = sampleOffset + PlaneLength;
-                int bOffset = sampleOffset + 2 * PlaneLength;
+                long diffSum = 0;
 
-                for (int ty = 0; ty < TileSize; ty++)
+                for (int ty = 0; ty < TileSize; ty += 2)
                 {
-                    int srcRow = (yBase + ty) * stride;
-                    int dstRow = ty * TileSize;
-
-                    for (int tx = 0; tx < TileSize; tx++)
+                    int rowOffset = (yBase + ty) * stride;
+                    for (int tx = 0; tx < TileSize; tx += 2)
                     {
-                        int px = srcRow + (xBase + tx) * 3;
-                        int dstIdx = dstRow + tx;
-
-                        float b = (_pixelBuffer[px] - 127.5f) * InvHalfByte;
-                        float g = (_pixelBuffer[px + 1] - 127.5f) * InvHalfByte;
-                        float r = (_pixelBuffer[px + 2] - 127.5f) * InvHalfByte;
-
-                        _tensorBuffer[rOffset + dstIdx] = r;
-                        _tensorBuffer[gOffset + dstIdx] = g;
-                        _tensorBuffer[bOffset + dstIdx] = b;
+                        int px = rowOffset + (xBase + tx) * 3;
+                        diffSum += Math.Abs(_pixelBuffer[px] - _prevPixelBuffer[px]);
+                        diffSum += Math.Abs(_pixelBuffer[px + 1] - _prevPixelBuffer[px + 1]);
+                        diffSum += Math.Abs(_pixelBuffer[px + 2] - _prevPixelBuffer[px + 2]);
                     }
+                }
+
+                if (diffSum >= thresholdSum)
+                    _dirtyTiles[count++] = (sr << 3) | sc;
+            }
+        }
+
+        return count;
+    }
+
+    private void PackDirtyTilesToTensor(int stride, int dirtyCount)
+    {
+        for (int i = 0; i < dirtyCount; i++)
+        {
+            int tileIdx = _dirtyTiles[i];
+            int sr = tileIdx >> 3;
+            int sc = tileIdx & 7;
+            int yBase = sr * TileSize;
+            int xBase = sc * TileSize;
+
+            int sampleOffset = i * SampleFloatLength;
+            int rOffset = sampleOffset;
+            int gOffset = sampleOffset + PlaneLength;
+            int bOffset = sampleOffset + 2 * PlaneLength;
+
+            for (int ty = 0; ty < TileSize; ty++)
+            {
+                int srcRow = (yBase + ty) * stride;
+                int dstRow = ty * TileSize;
+
+                for (int tx = 0; tx < TileSize; tx++)
+                {
+                    int px = srcRow + (xBase + tx) * 3;
+                    int dstIdx = dstRow + tx;
+
+                    float b = (_pixelBuffer[px] - 127.5f) * InvHalfByte;
+                    float g = (_pixelBuffer[px + 1] - 127.5f) * InvHalfByte;
+                    float r = (_pixelBuffer[px + 2] - 127.5f) * InvHalfByte;
+
+                    _tensorBuffer[rOffset + dstIdx] = r;
+                    _tensorBuffer[gOffset + dstIdx] = g;
+                    _tensorBuffer[bOffset + dstIdx] = b;
                 }
             }
         }
+    }
+
+    private BoardRecognitionResult BuildResultFromCache(bool playAsBlack)
+    {
+        char[,] grid = new char[8, 8];
+        double[,,] classScores = new double[8, 8, NumClasses];
+        double[,] confidences = new double[8, 8];
+        var activeCells = new List<(int Row, int Col, double Score)>(32);
+
+        for (int sr = 0; sr < 8; sr++)
+        {
+            for (int sc = 0; sc < 8; sc++)
+            {
+                int boardR = playAsBlack ? 7 - sr : sr;
+                int boardC = playAsBlack ? 7 - sc : sc;
+
+                int bestClass = 0;
+                double bestProb = _cachedScreenProbs[sr, sc, 0];
+                classScores[boardR, boardC, 0] = bestProb;
+
+                for (int k = 1; k < NumClasses; k++)
+                {
+                    double p = _cachedScreenProbs[sr, sc, k];
+                    classScores[boardR, boardC, k] = p;
+                    if (p > bestProb)
+                    {
+                        bestProb = p;
+                        bestClass = k;
+                    }
+                }
+
+                char piece = ClassToFen[bestClass];
+                grid[boardR, boardC] = piece;
+                confidences[boardR, boardC] = bestClass == 0 ? 0.0 : bestProb;
+
+                if (piece != '1')
+                    activeCells.Add((boardR, boardC, bestProb));
+            }
+        }
+
+        if (activeCells.Count > 32)
+        {
+            var toDrop = activeCells.OrderBy(x => x.Score).Take(activeCells.Count - 32);
+            foreach (var item in toDrop)
+                grid[item.Row, item.Col] = '1';
+        }
+
+        return new BoardRecognitionResult(grid, classScores, confidences, GridToFen(grid));
     }
 
     private static void ComputeSoftmax(Tensor<float> logits, int batchIdx, Span<double> probs)

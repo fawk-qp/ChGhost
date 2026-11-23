@@ -119,6 +119,12 @@ namespace ChGhost
 
         private ICalibratableRecognizer? CalibratableRecognizer => _recognizer as ICalibratableRecognizer;
 
+        private void InvalidateOnnxCache()
+        {
+            if (_recognizer is OnnxBoardRecognizer onnxRecognizer)
+                onnxRecognizer.InvalidateCache();
+        }
+
         private string GetActiveDbFileName() => $"board_auto_v13_p{_activeProfile}.json";
 
         private void ApplySpeedPreset()
@@ -206,6 +212,7 @@ namespace ChGhost
                         _topLeft = cursor;
                         SaveConfig();
                         DrawCalibrationGrid();
+                        InvalidateOnnxCache();
                         UpdateUI($"[П{_activeProfile}] Угол A8 задан ({_topLeft.X}, {_topLeft.Y}) -> теперь Alt+2 на H1");
                         break;
 
@@ -213,6 +220,7 @@ namespace ChGhost
                         _bottomRight = cursor;
                         SaveConfig();
                         DrawCalibrationGrid();
+                        InvalidateOnnxCache();
                         UpdateUI($"[П{_activeProfile}] Углы заданы! Нажмите Alt+3 на старте партии.");
                         break;
 
@@ -235,6 +243,7 @@ namespace ChGhost
 
                     case 7:
                         _playAsBlack = !_playAsBlack;
+                        InvalidateOnnxCache();
                         ResetBoardTracking();
                         RedrawOverlay();
                         UpdateUI();
@@ -347,6 +356,9 @@ namespace ChGhost
 
             if (CalibratableRecognizer == null)
             {
+                if (_recognizer is OnnxBoardRecognizer onnxRecognizer)
+                    TryDetectOnnxPlayAsBlack(onnxRecognizer);
+
                 ResetBoardTracking();
                 ClearGraphics();
                 if (!_isRunning)
@@ -402,6 +414,33 @@ namespace ChGhost
 
             UpdateUI("Полный пересчёт позиции с чистого листа -> считаю ход...");
             _ = ScanAndSuggestAsync(forceCalculate: true);
+        }
+
+        private void TryDetectOnnxPlayAsBlack(OnnxBoardRecognizer onnxRecognizer)
+        {
+            try
+            {
+                onnxRecognizer.InvalidateCache();
+                using Bitmap boardBmp = CaptureBoard();
+                BoardRecognitionResult recognition = onnxRecognizer.Recognize(boardBmp, _playAsBlack);
+                bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlack(recognition.RawGrid, _playAsBlack);
+                if (!detected.HasValue)
+                    return;
+
+                bool previous = _playAsBlack;
+                _playAsBlack = detected.Value;
+                if (_playAsBlack != previous)
+                {
+                    ResetBoardTracking();
+                    ClearGraphics();
+                    RedrawOverlay();
+                    UpdateUI($"[AI] Авто-цвет: {(_playAsBlack ? "ЧЁРНЫЕ" : "БЕЛЫЕ")}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("ONNX side auto-detection failed.", ex);
+            }
         }
 
         private void ManualFixPieceAtCursor(Point cursor)
@@ -836,6 +875,8 @@ namespace ChGhost
 
             _isScanning = true;
             bool playAsBlackSnap = _playAsBlack;
+            double inferMs = 0;
+            int dirtyCount = 0;
             try
             {
                 BoardRecognitionResult recognition = await Task.Run(() =>
@@ -843,6 +884,12 @@ namespace ChGhost
                     using Bitmap bmp = CaptureBoard();
                     return _recognizer.Recognize(bmp, playAsBlackSnap);
                 });
+
+                if (_recognizer is OnnxBoardRecognizer onnxRecognizer)
+                {
+                    inferMs = onnxRecognizer.LastInferenceMs;
+                    dirtyCount = onnxRecognizer.LastDirtySquareCount;
+                }
 
                 _appLifetime.Token.ThrowIfCancellationRequested();
                 await _engine.EnsureRunningAsync(_appLifetime.Token);
@@ -887,8 +934,12 @@ namespace ChGhost
                 string fullFen = $"{tracking.StableFen} {turn} {tracking.CastlingRights} - 0 1";
                 int moveTimeMs = _isBlitzTurboMode ? _settings.MoveTimeBlitzMs : _settings.MoveTimeRapidMs;
 
+                var sfStopwatch = System.Diagnostics.Stopwatch.StartNew();
                 string bestMove = await _engine.GetBestMoveAsync(fullFen, moveTimeMs, _appLifetime.Token);
-                if (bestMove.Length >= 4)
+                sfStopwatch.Stop();
+                _logger.Info($"[MOVE] black={playAsBlackSnap} | inferMs={inferMs:F1} | dirty={dirtyCount} | sfMs={sfStopwatch.Elapsed.TotalMilliseconds:F1} | fen={fullFen} | best={bestMove}");
+
+                if (bestMove.Length >= 4 && bestMove != "(none)")
                 {
                     _lastBestMove = bestMove;
 

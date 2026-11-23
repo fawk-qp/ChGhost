@@ -78,6 +78,10 @@ public sealed class StockfishEngine : IChessEngine
         {
             ThrowIfDisposed();
             await EnsureRunningCoreAsync(cancellationToken).ConfigureAwait(false);
+            await WriteCommandAsync("isready", cancellationToken).ConfigureAwait(false);
+            await WaitForLineAsync(line => line == "readyok", cancellationToken).ConfigureAwait(false);
+            DrainOutput();
+
             await WriteCommandAsync($"position fen {fen}", cancellationToken).ConfigureAwait(false);
             await WriteCommandAsync($"go movetime {Math.Clamp(moveTimeMs, 1, 60_000)}", cancellationToken).ConfigureAwait(false);
             string response = await WaitForLineAsync(line => line.StartsWith("bestmove ", StringComparison.Ordinal), cancellationToken)
@@ -85,7 +89,12 @@ public sealed class StockfishEngine : IChessEngine
             string[] parts = response.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length < 2)
                 throw new InvalidDataException($"Invalid Stockfish response: '{response}'.");
-            return parts[1];
+            string bestMove = parts[1];
+            if (bestMove == "(none)")
+                return bestMove;
+            if (!IsValidUciMove(bestMove))
+                throw new InvalidDataException($"Invalid Stockfish bestmove: '{response}'.");
+            return bestMove;
         }
         catch (Exception ex) when (IsEngineFailure(ex))
         {
@@ -178,6 +187,7 @@ public sealed class StockfishEngine : IChessEngine
             if (_settings.FullStrength)
             {
                 await WriteCommandAsync("setoption name UCI_LimitStrength value false", cancellationToken).ConfigureAwait(false);
+                await WriteCommandAsync("setoption name Skill Level value 20", cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -244,6 +254,34 @@ public sealed class StockfishEngine : IChessEngine
             throw new InvalidOperationException("Stockfish is not running.");
         await process.StandardInput.WriteLineAsync(command.AsMemory(), cancellationToken).ConfigureAwait(false);
         await process.StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private void DrainOutput()
+    {
+        ChannelReader<string>? reader = _output?.Reader;
+        if (reader == null)
+            return;
+        while (reader.TryRead(out _))
+        {
+        }
+    }
+
+    private static bool IsValidUciMove(string move)
+    {
+        if (move.Length is not (4 or 5))
+            return false;
+        for (int i = 0; i < 4; i += 2)
+        {
+            if (move[i] is < 'a' or > 'h' || move[i + 1] is < '1' or > '8')
+                return false;
+        }
+        if (move.Length == 5)
+        {
+            char promotion = char.ToLowerInvariant(move[4]);
+            if (promotion is not ('q' or 'r' or 'b' or 'n'))
+                return false;
+        }
+        return true;
     }
 
     private async Task<string> WaitForLineAsync(Func<string, bool> predicate, CancellationToken cancellationToken)

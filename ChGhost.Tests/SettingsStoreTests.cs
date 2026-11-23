@@ -17,9 +17,10 @@ public class SettingsStoreTests
         AppSettings settings = store.Load();
 
         Assert.True(File.Exists(path));
-        Assert.Equal(0, settings.EngineThreads);
-        Assert.InRange(settings.EffectiveEngineThreads, 1, 16);
-        Assert.Equal(512, settings.EngineHashMb);
+        Assert.Equal(4, settings.EngineThreads);
+        Assert.Equal(4, settings.EffectiveEngineThreads);
+        Assert.Equal(128, settings.EngineHashMb);
+        Assert.Equal(120, settings.ScanIntervalBlitzMs);
         Assert.Equal(2600, settings.TargetElo);
         Assert.Equal("Auto", settings.RecognizerMode);
         Assert.Equal("models/pieces_64x64.onnx", settings.OnnxModelPath);
@@ -56,7 +57,7 @@ public class SettingsStoreTests
 
         AppSettings settings = new SettingsStore(path, logger).Load();
 
-        Assert.Equal(512, settings.EngineHashMb);
+        Assert.Equal(128, settings.EngineHashMb);
         Assert.Equal(2600, settings.TargetElo);
         Assert.NotEmpty(logger.Errors);
         Assert.True(JsonDocument.Parse(File.ReadAllText(path)).RootElement.ValueKind == JsonValueKind.Object);
@@ -107,6 +108,7 @@ public class SettingsStoreTests
     public void ZeroEngineThreadsResolvesFromProcessorCountWithinLimits()
     {
         var settings = AppSettings.CreateDefaults();
+        settings.EngineThreads = 0;
 
         Assert.Equal(Math.Clamp(Environment.ProcessorCount - 2, 1, 16), settings.EffectiveEngineThreads);
         Assert.Equal(0, settings.EngineThreads);

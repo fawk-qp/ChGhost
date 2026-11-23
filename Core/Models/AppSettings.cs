@@ -4,13 +4,13 @@ namespace ChGhost.Core.Models;
 
 public sealed class AppSettings
 {
-    public int EngineThreads { get; set; }
-    public int EngineHashMb { get; set; } = 512;
+    public int EngineThreads { get; set; } = 4;
+    public int EngineHashMb { get; set; } = 128;
     public int TargetElo { get; set; } = 2600;
     public bool FullStrength { get; set; } = true;
     public int MoveTimeBlitzMs { get; set; } = 180;
     public int MoveTimeRapidMs { get; set; } = 550;
-    public int ScanIntervalBlitzMs { get; set; } = 220;
+    public int ScanIntervalBlitzMs { get; set; } = 120;
     public int ScanIntervalRapidMs { get; set; } = 450;
     public int CommandTimeoutMs { get; set; } = 3500;
     public string RecognizerMode { get; set; } = "Auto";
@@ -23,13 +23,13 @@ public sealed class AppSettings
 
     public static AppSettings CreateDefaults() => new()
     {
-        EngineThreads = 0,
-        EngineHashMb = 512,
+        EngineThreads = 4,
+        EngineHashMb = 128,
         TargetElo = 2600,
         FullStrength = true,
         MoveTimeBlitzMs = 180,
         MoveTimeRapidMs = 550,
-        ScanIntervalBlitzMs = 220,
+        ScanIntervalBlitzMs = 120,
         ScanIntervalRapidMs = 450,
         CommandTimeoutMs = 3500
         , RecognizerMode = "Auto"
