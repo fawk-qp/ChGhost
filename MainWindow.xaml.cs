@@ -76,6 +76,9 @@ namespace ChGhost
         private string _lastMoveRussianText = "";
         private bool _lastMoveIsCastling = false;
         private string _debugInfo = "";
+        private bool _lastBoardVisible = true;
+        private string _lastIllegalFen = "";
+        private string? _activeFen = null;
 
         private char[,]? _currentGrid = null;
         private bool _isScanning = false;
@@ -517,6 +520,8 @@ namespace ChGhost
             _lastMoveRussianText = "";
             _lastMoveIsCastling = false;
             _debugInfo = "";
+            _lastIllegalFen = "";
+            _activeFen = null;
             _currentGrid = null;
         }
 
@@ -875,6 +880,7 @@ namespace ChGhost
 
             _isScanning = true;
             bool playAsBlackSnap = _playAsBlack;
+            _activeFen = null;
             double inferMs = 0;
             int dirtyCount = 0;
             try
@@ -889,6 +895,17 @@ namespace ChGhost
                 {
                     inferMs = onnxRecognizer.LastInferenceMs;
                     dirtyCount = onnxRecognizer.LastDirtySquareCount;
+                    if (!onnxRecognizer.LastBoardVisible)
+                    {
+                        if (_lastBoardVisible)
+                        {
+                            _logger.Info("Board is occluded; pausing board scans.");
+                            _lastBoardVisible = false;
+                        }
+                        UpdateUI("Доска перекрыта / не видна — сканирование на паузе");
+                        return;
+                    }
+                    _lastBoardVisible = true;
                 }
 
                 _appLifetime.Token.ThrowIfCancellationRequested();
@@ -932,7 +949,21 @@ namespace ChGhost
 
                 char turn = playAsBlackSnap ? 'b' : 'w';
                 string fullFen = $"{tracking.StableFen} {turn} {tracking.CastlingRights} - 0 1";
+                _activeFen = fullFen;
                 int moveTimeMs = _isBlitzTurboMode ? _settings.MoveTimeBlitzMs : _settings.MoveTimeRapidMs;
+
+                var (isLegal, illegalReason) = FenLegalityValidator.Validate(stableGrid, whiteToMove: !playAsBlackSnap);
+                if (!isLegal)
+                {
+                    if (fullFen != _lastIllegalFen)
+                    {
+                        _logger.Info($"[SKIP] Illegal FEN: {illegalReason} | fen={fullFen}");
+                        _lastIllegalFen = fullFen;
+                    }
+                    _debugInfo = $"Нелегальная позиция: {illegalReason}";
+                    UpdateUI(_debugInfo);
+                    return;
+                }
 
                 var sfStopwatch = System.Diagnostics.Stopwatch.StartNew();
                 string bestMove = await _engine.GetBestMoveAsync(fullFen, moveTimeMs, _appLifetime.Token);
@@ -983,7 +1014,7 @@ namespace ChGhost
             }
             catch (Exception ex)
             {
-                _logger.Error("Board scan or Stockfish operation failed.", ex);
+                _logger.Error($"Board scan or Stockfish operation failed. fen={_activeFen ?? "-"}", ex);
                 _debugInfo = File.Exists(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "stockfish.exe"))
                     ? $"Ошибка движка: {ex.Message}"
                     : "Не найден stockfish.exe рядом с ChGhost.exe.";

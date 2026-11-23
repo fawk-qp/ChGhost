@@ -73,6 +73,7 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
     public bool IsReady => !_disposed;
     public double LastInferenceMs { get; private set; }
     public int LastDirtySquareCount { get; private set; }
+    public bool LastBoardVisible { get; private set; } = true;
 
     public void InvalidateCache()
     {
@@ -143,6 +144,18 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
 
             var sw = Stopwatch.StartNew();
             int stride = CaptureResizedPixels(board);
+
+            if (!BoardPresenceChecker.IsCheckerboardPresent(_pixelBuffer, stride))
+            {
+                LastBoardVisible = false;
+                LastDirtySquareCount = 0;
+                sw.Stop();
+                LastInferenceMs = sw.Elapsed.TotalMilliseconds;
+                _hasCache = false;
+                return CreateEmptyResult();
+            }
+
+            LastBoardVisible = true;
 
             bool forceFull = !_hasCache
                 || _prevStride != stride
@@ -310,6 +323,15 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
                 }
             }
         }
+    }
+
+    private static BoardRecognitionResult CreateEmptyResult()
+    {
+        var grid = new char[8, 8];
+        for (int r = 0; r < 8; r++)
+        for (int c = 0; c < 8; c++)
+            grid[r, c] = '1';
+        return new BoardRecognitionResult(grid, new double[8, 8, NumClasses], new double[8, 8], "8/8/8/8/8/8/8/8");
     }
 
     private BoardRecognitionResult BuildResultFromCache(bool playAsBlack)
