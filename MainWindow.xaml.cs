@@ -1,12 +1,10 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows;
@@ -15,31 +13,15 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
+using ChGhost.Core.Contracts;
+using ChGhost.Core.Models;
+using ChGhost.Core.Tracking;
+using ChGhost.Core.Vision;
 using Color = System.Drawing.Color;
 using Point = System.Drawing.Point;
 
 namespace ChGhost
 {
-    public class PieceTemplate
-    {
-        public double[] EdgePatch { get; set; } = Array.Empty<double>();
-        public double[] MaskPatch { get; set; } = Array.Empty<double>();
-        public double PieceLuma { get; set; }
-        public double RawContrast { get; set; }
-        public int ForegroundPixels { get; set; }
-        public bool IsWhite { get; set; }
-    }
-
-    public class SavedConfig
-    {
-        public int TopLeftX { get; set; }
-        public int TopLeftY { get; set; }
-        public int BottomRightX { get; set; }
-        public int BottomRightY { get; set; }
-        public double WhiteBlackThreshold { get; set; } = 150.0;
-        public Dictionary<char, List<PieceTemplate>> Signatures { get; set; } = new();
-    }
-
     public partial class MainWindow : Window
     {
         private const uint WDA_EXCLUDEFROMCAPTURE = 0x00000011;
@@ -80,10 +62,12 @@ namespace ChGhost
         private static readonly int ENGINE_THREADS = Math.Max(4, Environment.ProcessorCount - 2);
         private const int ENGINE_HASH_MB = 512;
 
-        private const string DB_FILE = "board_auto_v10.json";
-        private const string LEGACY_V9_FILE = "board_auto_v9.json";
-        private const int PATCH_SIZE = 32;
-        private static readonly char[] PieceTypesUpper = { 'P', 'N', 'B', 'R', 'Q', 'K' };
+        private const int PROFILE_COUNT = 3;
+
+        private int _activeProfile = 1;
+        private readonly ICalibratableRecognizer _recognizer = new TemplateRecognizer();
+        private readonly IBoardDetector _boardDetector = new ManualBoardDetector();
+        private readonly GameStateTracker _gameStateTracker = new();
 
         private readonly (char fen, string name)[] _manualFixOrder =
         {
@@ -94,11 +78,18 @@ namespace ChGhost
         };
         private int _fixIndex = 0;
 
-        private Dictionary<char, List<PieceTemplate>> _pieceSignatures = new();
-        private double _whiteBlackThreshold = 150.0;
+        private Point _topLeft
+        {
+            get => _boardDetector.TopLeft ?? Point.Empty;
+            set => _boardDetector.SetTopLeft(value.X, value.Y);
+        }
 
-        private Point _topLeft = Point.Empty;
-        private Point _bottomRight = Point.Empty;
+        private Point _bottomRight
+        {
+            get => _boardDetector.BottomRight ?? Point.Empty;
+            set => _boardDetector.SetBottomRight(value.X, value.Y);
+        }
+
         private bool _isRunning = false;
         private bool _playAsBlack = false;
         private bool _isHidden = false;
@@ -111,14 +102,11 @@ namespace ChGhost
         private string _sfExpectedPrefix = "";
 
         private readonly DispatcherTimer _scanTimer = new();
-        private string _lastStableFen = "";
-        private string _lastRawFen = "";
         private string _lastBestMove = "";
         private string _lastMoveRussianText = "";
         private bool _lastMoveIsCastling = false;
         private string _debugInfo = "";
 
-        private char[,]? _confirmedGrid = null;
         private char[,]? _currentGrid = null;
         private bool _isScanning = false;
 
@@ -131,6 +119,8 @@ namespace ChGhost
             ApplySpeedPreset();
             _scanTimer.Tick += async (_, _) => await ScanAndSuggestAsync();
         }
+
+        private string GetActiveDbFileName() => $"board_auto_v13_p{_activeProfile}.json";
 
         private void ApplySpeedPreset()
         {
@@ -164,6 +154,7 @@ namespace ChGhost
             RegisterHotKey(hwnd, 12, mods, 0x46);
             RegisterHotKey(hwnd, 14, mods, 0x42);
             RegisterHotKey(hwnd, 15, mods, 0x45);
+            RegisterHotKey(hwnd, 16, mods, 0x50);
 
             HwndSource.FromHwnd(hwnd)?.AddHook(WndProc);
             UpdateUI();
@@ -182,14 +173,14 @@ namespace ChGhost
                         _topLeft = cursor;
                         SaveConfig();
                         DrawCalibrationGrid();
-                        UpdateUI($"Угол A8 задан ({_topLeft.X}, {_topLeft.Y}) -> теперь Alt+2 на H1");
+                        UpdateUI($"[П{_activeProfile}] Угол A8 задан ({_topLeft.X}, {_topLeft.Y}) -> теперь Alt+2 на H1");
                         break;
 
                     case 2:
                         _bottomRight = cursor;
                         SaveConfig();
                         DrawCalibrationGrid();
-                        UpdateUI("Углы заданы! Нажмите Alt+3 на старте партии (1 раз) для калибровки.");
+                        UpdateUI($"[П{_activeProfile}] Углы заданы! Нажмите Alt+3 на старте партии.");
                         break;
 
                     case 3:
@@ -254,31 +245,55 @@ namespace ChGhost
                         if (_isRunning)
                             _ = ScanAndSuggestAsync(forceCalculate: true);
                         break;
+
+                    case 16:
+                        SwitchProfile();
+                        break;
                 }
                 handled = true;
             }
             return IntPtr.Zero;
         }
 
-        private bool HasValidBoardBounds()
+        private void SwitchProfile()
         {
-            return _topLeft != Point.Empty
-                && _bottomRight != Point.Empty
-                && (_bottomRight.X - _topLeft.X) >= 120
-                && (_bottomRight.Y - _topLeft.Y) >= 120;
+            _activeProfile = (_activeProfile % PROFILE_COUNT) + 1;
+            _boardDetector.Reset();
+            _recognizer.ResetCalibration();
+            ResetBoardTracking();
+            ClearGraphics();
+            LoadConfig();
+
+            if (HasValidBoardBounds() && HasValidSignatures())
+            {
+                UpdateUI($"Включён Профиль {_activeProfile} -> синхронизирую доску...");
+                if (_isRunning)
+                    _ = ScanAndSuggestAsync(forceCalculate: true);
+            }
+            else if (HasValidBoardBounds())
+            {
+                _isRunning = false;
+                _scanTimer.Stop();
+                UpdateUI($"Профиль {_activeProfile}: углы есть, нажмите 1 раз Alt+3 на старте партии!");
+            }
+            else
+            {
+                _isRunning = false;
+                _scanTimer.Stop();
+                UpdateUI($"Профиль {_activeProfile}: задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте!");
+            }
         }
 
-        private bool HasValidSignatures()
+        private bool HasValidBoardBounds()
         {
-            if (_pieceSignatures.Count < 12) return false;
-            foreach (var kv in _pieceSignatures)
-            {
-                if (kv.Value == null || kv.Value.Count == 0) return false;
-                if (kv.Value.Any(t => t.EdgePatch.Length != PATCH_SIZE * PATCH_SIZE || t.MaskPatch.Length != PATCH_SIZE * PATCH_SIZE))
-                    return false;
-            }
-            return true;
+            BoardRect? bounds = _boardDetector.Detect();
+            return _topLeft != Point.Empty
+                && _bottomRight != Point.Empty
+                && bounds.HasValue
+                && bounds.Value.IsValid;
         }
+
+        private bool HasValidSignatures() => _recognizer.IsReady;
 
         private void SmartAlt3Action()
         {
@@ -291,86 +306,11 @@ namespace ChGhost
             if (!HasValidSignatures())
                 LoadConfig();
 
-            bool playAsBlackSnap = _playAsBlack;
             using Bitmap boardBmp = CaptureBoard();
-            int backRanksOccupied = 0;
-            int centerOccupied = 0;
-
-            var templatesGrid = new PieceTemplate[8, 8];
-            for (int r = 0; r < 8; r++)
+            CalibrationOutcome calibration = _recognizer.CalibrateStartingPosition(boardBmp, _playAsBlack);
+            if (calibration.IsStartingPosition)
             {
-                for (int c = 0; c < 8; c++)
-                {
-                    var tpl = ExtractPieceTemplate32x32(boardBmp, r, c);
-                    templatesGrid[r, c] = tpl;
-
-                    bool hasPiece = IsCellOccupied(tpl);
-                    if (r == 0 || r == 1 || r == 6 || r == 7)
-                    {
-                        if (hasPiece) backRanksOccupied++;
-                    }
-                    else
-                    {
-                        if (hasPiece) centerOccupied++;
-                    }
-                }
-            }
-
-            bool isStartingLayout = (backRanksOccupied >= 26 && centerOccupied <= 2);
-
-            if (isStartingLayout)
-            {
-                string[] startRows =
-                {
-                    "rnbqkbnr",
-                    "pppppppp",
-                    "........",
-                    "........",
-                    "........",
-                    "........",
-                    "PPPPPPPP",
-                    "RNBQKBNR"
-                };
-
-                _pieceSignatures.Clear();
-                var whiteLumas = new List<double>();
-                var blackLumas = new List<double>();
-                var seenSquareParity = new HashSet<(char piece, int parity)>();
-
-                for (int r = 0; r < 8; r++)
-                {
-                    for (int c = 0; c < 8; c++)
-                    {
-                        int boardR = playAsBlackSnap ? 7 - r : r;
-                        int boardC = playAsBlackSnap ? 7 - c : c;
-                        char piece = startRows[boardR][boardC];
-                        if (piece == '.') continue;
-
-                        var tpl = templatesGrid[r, c];
-                        bool isWhitePiece = char.IsUpper(piece);
-                        tpl.IsWhite = isWhitePiece;
-
-                        if (isWhitePiece) whiteLumas.Add(tpl.PieceLuma);
-                        else blackLumas.Add(tpl.PieceLuma);
-
-                        int parity = (r + c) & 1;
-                        if (!_pieceSignatures.ContainsKey(piece))
-                            _pieceSignatures[piece] = new List<PieceTemplate>();
-
-                        if (seenSquareParity.Add((piece, parity)) || _pieceSignatures[piece].Count < 2)
-                            _pieceSignatures[piece].Add(tpl);
-                    }
-                }
-
-                if (whiteLumas.Count > 0 && blackLumas.Count > 0)
-                {
-                    whiteLumas.Sort();
-                    blackLumas.Sort();
-                    double medianWhite = whiteLumas[whiteLumas.Count / 2];
-                    double medianBlack = blackLumas[blackLumas.Count / 2];
-                    _whiteBlackThreshold = (medianWhite + medianBlack) * 0.5;
-                }
-
+                _playAsBlack = calibration.PlayAsBlack;
                 SaveConfig();
                 ResetBoardTracking();
                 SendUciNewGame();
@@ -382,14 +322,15 @@ namespace ChGhost
                     _scanTimer.Start();
                 }
 
-                UpdateUI($"Эталоны v10 сняты со старта (порог={_whiteBlackThreshold:F0}) -> Считаю ход...");
+                string sideDetected = _playAsBlack ? "ЧЁРНЫЕ" : "БЕЛЫЕ";
+                UpdateUI($"[П{_activeProfile}] Старт v13 снят ({sideDetected}, Б={calibration.WhiteLuma:F0}/Ч={calibration.BlackLuma:F0}) -> Считаю ход...");
                 _ = ScanAndSuggestAsync(forceCalculate: true);
                 return;
             }
 
             if (!HasValidSignatures())
             {
-                UpdateUI($"Нет базы эталонов v10 (края={backRanksOccupied}, центр={centerOccupied}). Нажмите 1 раз Alt+3 на стартовой доске!");
+                UpdateUI($"[П{_activeProfile}] Нет эталонов v13 (края={calibration.BackRanksOccupied}, центр={calibration.CenterOccupied}). Нажмите 1 раз Alt+3 на стартовой доске!");
                 return;
             }
 
@@ -414,11 +355,12 @@ namespace ChGhost
                 return;
             }
 
-            double cellW = (_bottomRight.X - _topLeft.X) / 8.0;
-            double cellH = (_bottomRight.Y - _topLeft.Y) / 8.0;
+            BoardRect bounds = _boardDetector.Detect()!.Value;
+            double cellW = bounds.Width / 8.0;
+            double cellH = bounds.Height / 8.0;
 
-            int col = (int)((cursor.X - _topLeft.X) / cellW);
-            int row = (int)((cursor.Y - _topLeft.Y) / cellH);
+            int col = (int)((cursor.X - bounds.Left) / cellW);
+            int row = (int)((cursor.Y - bounds.Top) / cellH);
 
             if (col < 0 || col > 7 || row < 0 || row > 7)
             {
@@ -430,24 +372,14 @@ namespace ChGhost
             string savedName = _manualFixOrder[_fixIndex].name;
 
             using Bitmap boardBmp = CaptureBoard();
-            var tpl = ExtractPieceTemplate32x32(boardBmp, row, col);
-            tpl.IsWhite = char.IsUpper(targetFen);
-
-            if (!_pieceSignatures.ContainsKey(targetFen))
-                _pieceSignatures[targetFen] = new List<PieceTemplate>();
-
-            _pieceSignatures[targetFen].Add(tpl);
-            if (_pieceSignatures[targetFen].Count > 3)
-                _pieceSignatures[targetFen].RemoveAt(0);
-
-            RecalculateWhiteBlackThreshold();
+            _recognizer.CalibratePiece(boardBmp, new Square(row, col), ToPieceClass(targetFen));
             SaveConfig();
 
             _fixIndex = (_fixIndex + 1) % _manualFixOrder.Length;
 
             if (!HasValidSignatures())
             {
-                UpdateUI($"Записано: [{savedName}] ({_pieceSignatures.Count}/12). Далее: [{_manualFixOrder[_fixIndex].name}] -> Alt+F");
+                UpdateUI($"Записано: [{savedName}] ({_recognizer.CalibrationClassCount}/12). Далее: [{_manualFixOrder[_fixIndex].name}] -> Alt+F");
             }
             else
             {
@@ -458,38 +390,30 @@ namespace ChGhost
             }
         }
 
-        private void RecalculateWhiteBlackThreshold()
+        private static PieceClass ToPieceClass(char piece) => piece switch
         {
-            var whiteLumas = new List<double>();
-            var blackLumas = new List<double>();
-
-            foreach (var kv in _pieceSignatures)
-            {
-                bool isWhite = char.IsUpper(kv.Key);
-                foreach (var t in kv.Value)
-                {
-                    if (isWhite) whiteLumas.Add(t.PieceLuma);
-                    else blackLumas.Add(t.PieceLuma);
-                }
-            }
-
-            if (whiteLumas.Count > 0 && blackLumas.Count > 0)
-            {
-                whiteLumas.Sort();
-                blackLumas.Sort();
-                _whiteBlackThreshold = (whiteLumas[whiteLumas.Count / 2] + blackLumas[blackLumas.Count / 2]) * 0.5;
-            }
-        }
+            'P' => PieceClass.WhitePawn,
+            'N' => PieceClass.WhiteKnight,
+            'B' => PieceClass.WhiteBishop,
+            'R' => PieceClass.WhiteRook,
+            'Q' => PieceClass.WhiteQueen,
+            'K' => PieceClass.WhiteKing,
+            'p' => PieceClass.BlackPawn,
+            'n' => PieceClass.BlackKnight,
+            'b' => PieceClass.BlackBishop,
+            'r' => PieceClass.BlackRook,
+            'q' => PieceClass.BlackQueen,
+            'k' => PieceClass.BlackKing,
+            _ => PieceClass.Empty
+        };
 
         private void ResetBoardTracking()
         {
-            _lastStableFen = "";
-            _lastRawFen = "";
+            _gameStateTracker.Reset();
             _lastBestMove = "";
             _lastMoveRussianText = "";
             _lastMoveIsCastling = false;
             _debugInfo = "";
-            _confirmedGrid = null;
             _currentGrid = null;
         }
 
@@ -657,7 +581,7 @@ namespace ChGhost
             string speedText = _isBlitzTurboMode ? "БЛИЦ" : "РАПИД";
             string powerText = _fullStrength ? $"MAX • {ENGINE_THREADS}T" : TARGET_ELO.ToString();
 
-            HeaderText.Text = $"CHESS GHOST • {sideText} • {stateText} • {speedText} ({powerText})";
+            HeaderText.Text = $"CHESS GHOST [П{_activeProfile}] • {sideText} • {stateText} • {speedText} ({powerText})";
             HeaderText.Foreground = _isRunning
                 ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(0, 255, 136))
                 : new SolidColorBrush(System.Windows.Media.Color.FromRgb(255, 200, 60));
@@ -670,28 +594,28 @@ namespace ChGhost
 
             if (!HasValidBoardBounds())
             {
-                StatusText.Text = "1. Угол A8 -> Alt+1 | 2. Угол H1 -> Alt+2";
+                StatusText.Text = $"[П{_activeProfile}] 1. Угол A8 -> Alt+1 | 2. Угол H1 -> Alt+2 | Alt+P: профиль (1-3)";
                 return;
             }
 
             if (!HasValidSignatures())
             {
-                StatusText.Text = $"Откройте старт партии и нажмите 1 раз Alt+3 (или вручную: [{_manualFixOrder[_fixIndex].name}] -> Alt+F)";
+                StatusText.Text = $"[П{_activeProfile}] Откройте старт партии и нажмите 1 раз Alt+3 | Alt+P: профиль";
                 return;
             }
 
             if (_isRunning)
             {
                 if (!string.IsNullOrEmpty(_lastMoveRussianText))
-                    StatusText.Text = $"ТВОЙ ХОД: {_lastMoveRussianText} | Alt+3: пересчитать | Alt+B: скорость";
+                    StatusText.Text = $"ТВОЙ ХОД: {_lastMoveRussianText} | Alt+3: обновить | Alt+P: профиль";
                 else if (!string.IsNullOrEmpty(_debugInfo))
                     StatusText.Text = _debugInfo;
                 else
-                    StatusText.Text = "Жду хода соперника... (Alt+3: пересчитать заново | Alt+B: блиц/рапид)";
+                    StatusText.Text = "Жду хода соперника... (Alt+3: пересчитать | Alt+P: профиль)";
             }
             else
             {
-                StatusText.Text = $"Готово! Alt+3 или Alt+S: старт | Режим: {speedText} (Alt+B)";
+                StatusText.Text = $"Готово [П{_activeProfile}]! Alt+3 или Alt+S: старт | Alt+P: профиль | Alt+B: {speedText}";
             }
         }
 
@@ -699,31 +623,25 @@ namespace ChGhost
         {
             _isRunning = false;
             _scanTimer.Stop();
-            _pieceSignatures.Clear();
-            _whiteBlackThreshold = 150.0;
+            _recognizer.ResetCalibration();
             _fixIndex = 0;
-            _topLeft = Point.Empty;
-            _bottomRight = Point.Empty;
+            _boardDetector.Reset();
             ResetBoardTracking();
 
-            string cfgPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, DB_FILE);
+            string cfgPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, GetActiveDbFileName());
             if (File.Exists(cfgPath)) File.Delete(cfgPath);
             ClearGraphics();
-            UpdateUI("Сброшено! Задайте углы доски: Alt+1 и Alt+2.");
+            UpdateUI($"[П{_activeProfile}] Сброшено! Задайте углы доски: Alt+1 и Alt+2.");
         }
 
         private void SaveConfig()
         {
-            string cfgPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, DB_FILE);
-            var cfg = new SavedConfig
-            {
-                TopLeftX = _topLeft.X,
-                TopLeftY = _topLeft.Y,
-                BottomRightX = _bottomRight.X,
-                BottomRightY = _bottomRight.Y,
-                WhiteBlackThreshold = _whiteBlackThreshold,
-                Signatures = _pieceSignatures
-            };
+            string cfgPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, GetActiveDbFileName());
+            SavedConfig cfg = _recognizer.ExportCalibration();
+            cfg.TopLeftX = _topLeft.X;
+            cfg.TopLeftY = _topLeft.Y;
+            cfg.BottomRightX = _bottomRight.X;
+            cfg.BottomRightY = _bottomRight.Y;
             File.WriteAllText(cfgPath, JsonSerializer.Serialize(cfg));
         }
 
@@ -731,27 +649,26 @@ namespace ChGhost
         {
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
             string curDir = Directory.GetCurrentDirectory();
+            string dbFile = GetActiveDbFileName();
 
-            string[] v10Candidates =
+            string[] candidates =
             {
-                System.IO.Path.Combine(baseDir, DB_FILE),
-                System.IO.Path.Combine(curDir, DB_FILE),
-                System.IO.Path.Combine(curDir, "Release_Build", DB_FILE),
-                System.IO.Path.Combine(curDir, "ChGhost_v1.0_Win64", DB_FILE)
+                System.IO.Path.Combine(baseDir, dbFile),
+                System.IO.Path.Combine(curDir, dbFile),
+                System.IO.Path.Combine(curDir, "Release_Build", dbFile)
             };
 
-            string? v10Path = v10Candidates.FirstOrDefault(File.Exists);
-            if (!string.IsNullOrEmpty(v10Path))
+            string? path = candidates.FirstOrDefault(File.Exists);
+            if (!string.IsNullOrEmpty(path))
             {
                 try
                 {
-                    var cfg = JsonSerializer.Deserialize<SavedConfig>(File.ReadAllText(v10Path));
+                    var cfg = JsonSerializer.Deserialize<SavedConfig>(File.ReadAllText(path));
                     if (cfg != null)
                     {
+                        _recognizer.ImportCalibration(cfg);
                         _topLeft = new Point(cfg.TopLeftX, cfg.TopLeftY);
                         _bottomRight = new Point(cfg.BottomRightX, cfg.BottomRightY);
-                        _whiteBlackThreshold = cfg.WhiteBlackThreshold > 50.0 ? cfg.WhiteBlackThreshold : 150.0;
-                        _pieceSignatures = cfg.Signatures ?? new();
                         if (HasValidSignatures())
                             return;
                     }
@@ -759,17 +676,25 @@ namespace ChGhost
                 catch { }
             }
 
-            string[] legacyCandidates =
+            string[] legacyNames = _activeProfile switch
             {
-                System.IO.Path.Combine(baseDir, LEGACY_V9_FILE),
-                System.IO.Path.Combine(curDir, LEGACY_V9_FILE),
-                System.IO.Path.Combine(curDir, "Release_Build", LEGACY_V9_FILE),
-                System.IO.Path.Combine(curDir, "ChGhost_v1.0_Win64", LEGACY_V9_FILE)
+                1 => new[] { "board_auto_v12.json", "board_auto_v11.json", "board_auto_v10.json", "board_auto_v9.json" },
+                2 => new[] { "board_auto_v12_p2.json", "board_auto_v11_p2.json", "board_auto_v10_p2.json" },
+                _ => Array.Empty<string>()
             };
 
-            string? legacyPath = legacyCandidates.FirstOrDefault(File.Exists);
-            if (!string.IsNullOrEmpty(legacyPath))
+            foreach (string legacyName in legacyNames)
             {
+                string[] legacyPaths =
+                {
+                    System.IO.Path.Combine(baseDir, legacyName),
+                    System.IO.Path.Combine(curDir, legacyName),
+                    System.IO.Path.Combine(curDir, "Release_Build", legacyName)
+                };
+
+                string? legacyPath = legacyPaths.FirstOrDefault(File.Exists);
+                if (string.IsNullOrEmpty(legacyPath)) continue;
+
                 try
                 {
                     var legacyCfg = JsonSerializer.Deserialize<SavedConfig>(File.ReadAllText(legacyPath));
@@ -777,6 +702,7 @@ namespace ChGhost
                     {
                         _topLeft = new Point(legacyCfg.TopLeftX, legacyCfg.TopLeftY);
                         _bottomRight = new Point(legacyCfg.BottomRightX, legacyCfg.BottomRightY);
+                        break;
                     }
                 }
                 catch { }
@@ -787,7 +713,7 @@ namespace ChGhost
         {
             if (!HasValidBoardBounds() || !HasValidSignatures())
             {
-                UpdateUI("Сначала задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте партии!");
+                UpdateUI($"[П{_activeProfile}] Сначала задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте партии!");
                 return;
             }
 
@@ -853,499 +779,13 @@ namespace ChGhost
 
         private Bitmap CaptureBoard()
         {
-            int width = _bottomRight.X - _topLeft.X;
-            int height = _bottomRight.Y - _topLeft.Y;
+            BoardRect bounds = _boardDetector.Detect() ?? throw new InvalidOperationException("Board bounds are not configured.");
+            int width = bounds.Width;
+            int height = bounds.Height;
             Bitmap bmp = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
             using Graphics g = Graphics.FromImage(bmp);
-            g.CopyFromScreen(_topLeft.X, _topLeft.Y, 0, 0, new System.Drawing.Size(width, height));
+            g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, new System.Drawing.Size(width, height));
             return bmp;
-        }
-
-        private static bool IsCellOccupied(PieceTemplate tpl)
-        {
-            return tpl.ForegroundPixels >= 75 && tpl.RawContrast >= 12.0;
-        }
-
-        private PieceTemplate ExtractPieceTemplate32x32(Bitmap board, int row, int col)
-        {
-            double cellW = board.Width / 8.0;
-            double cellH = board.Height / 8.0;
-
-            int x0 = (int)(col * cellW);
-            int y0 = (int)(row * cellH);
-
-            int srcX = Math.Clamp((int)(x0 + cellW * 0.08), 0, Math.Max(0, board.Width - 1));
-            int srcY = Math.Clamp((int)(y0 + cellH * 0.08), 0, Math.Max(0, board.Height - 1));
-            int srcW = Math.Clamp((int)(cellW * 0.84), 1, board.Width - srcX);
-            int srcH = Math.Clamp((int)(cellH * 0.84), 1, board.Height - srcY);
-
-            using Bitmap patchBmp = new Bitmap(PATCH_SIZE, PATCH_SIZE, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
-            using (Graphics g = Graphics.FromImage(patchBmp))
-            {
-                g.InterpolationMode = InterpolationMode.HighQualityBilinear;
-                g.DrawImage(board, new System.Drawing.Rectangle(0, 0, PATCH_SIZE, PATCH_SIZE),
-                            new System.Drawing.Rectangle(srcX, srcY, srcW, srcH), GraphicsUnit.Pixel);
-            }
-
-            var bmpData = patchBmp.LockBits(
-                new System.Drawing.Rectangle(0, 0, PATCH_SIZE, PATCH_SIZE),
-                System.Drawing.Imaging.ImageLockMode.ReadOnly,
-                System.Drawing.Imaging.PixelFormat.Format24bppRgb);
-
-            int stride = bmpData.Stride;
-            byte[] rawBytes = new byte[stride * PATCH_SIZE];
-            Marshal.Copy(bmpData.Scan0, rawBytes, 0, rawBytes.Length);
-            patchBmp.UnlockBits(bmpData);
-
-            double[,] rGrid = new double[PATCH_SIZE, PATCH_SIZE];
-            double[,] gGrid = new double[PATCH_SIZE, PATCH_SIZE];
-            double[,] bGrid = new double[PATCH_SIZE, PATCH_SIZE];
-            double[,] lumaGrid = new double[PATCH_SIZE, PATCH_SIZE];
-
-            for (int y = 0; y < PATCH_SIZE; y++)
-            {
-                int rowOffset = y * stride;
-                for (int x = 0; x < PATCH_SIZE; x++)
-                {
-                    int idx = rowOffset + x * 3;
-                    double b = rawBytes[idx];
-                    double g = rawBytes[idx + 1];
-                    double r = rawBytes[idx + 2];
-                    rGrid[y, x] = r;
-                    gGrid[y, x] = g;
-                    bGrid[y, x] = b;
-                    lumaGrid[y, x] = 0.299 * r + 0.587 * g + 0.114 * b;
-                }
-            }
-
-            var bgRs = new List<double>(80);
-            var bgGs = new List<double>(80);
-            var bgBs = new List<double>(80);
-
-            for (int x = 7; x <= 27; x++)
-            {
-                bgRs.Add(rGrid[0, x]); bgGs.Add(gGrid[0, x]); bgBs.Add(bGrid[0, x]);
-                bgRs.Add(rGrid[1, x]); bgGs.Add(gGrid[1, x]); bgBs.Add(bGrid[1, x]);
-            }
-            for (int y = 3; y <= 24; y++)
-            {
-                bgRs.Add(rGrid[y, 31]); bgGs.Add(gGrid[y, 31]); bgBs.Add(bGrid[y, 31]);
-            }
-            for (int y = 7; y <= 24; y++)
-            {
-                bgRs.Add(rGrid[y, 0]); bgGs.Add(gGrid[y, 0]); bgBs.Add(bGrid[y, 0]);
-            }
-
-            bgRs.Sort(); bgGs.Sort(); bgBs.Sort();
-            double bgR = bgRs[bgRs.Count / 2];
-            double bgG = bgGs[bgGs.Count / 2];
-            double bgB = bgBs[bgBs.Count / 2];
-
-            double[,] gradGrid = new double[PATCH_SIZE, PATCH_SIZE];
-            for (int y = 0; y < PATCH_SIZE; y++)
-            {
-                int ym = Math.Max(0, y - 1);
-                int yp = Math.Min(PATCH_SIZE - 1, y + 1);
-                for (int x = 0; x < PATCH_SIZE; x++)
-                {
-                    int xm = Math.Max(0, x - 1);
-                    int xp = Math.Min(PATCH_SIZE - 1, x + 1);
-
-                    double gxR = (rGrid[ym, xp] + 2 * rGrid[y, xp] + rGrid[yp, xp] - rGrid[ym, xm] - 2 * rGrid[y, xm] - rGrid[yp, xm]) * 0.25;
-                    double gyR = (rGrid[yp, xm] + 2 * rGrid[yp, x] + rGrid[yp, xp] - rGrid[ym, xm] - 2 * rGrid[ym, x] - rGrid[ym, xp]) * 0.25;
-
-                    double gxG = (gGrid[ym, xp] + 2 * gGrid[y, xp] + gGrid[yp, xp] - gGrid[ym, xm] - 2 * gGrid[y, xm] - gGrid[yp, xm]) * 0.25;
-                    double gyG = (gGrid[yp, xm] + 2 * gGrid[yp, x] + gGrid[yp, xp] - gGrid[ym, xm] - 2 * gGrid[ym, x] - gGrid[ym, xp]) * 0.25;
-
-                    double gxB = (bGrid[ym, xp] + 2 * bGrid[y, xp] + bGrid[yp, xp] - bGrid[ym, xm] - 2 * bGrid[y, xm] - bGrid[yp, xm]) * 0.25;
-                    double gyB = (bGrid[yp, xm] + 2 * bGrid[yp, x] + bGrid[yp, xp] - bGrid[ym, xm] - 2 * bGrid[ym, x] - bGrid[ym, xp]) * 0.25;
-
-                    gradGrid[y, x] = Math.Sqrt((gxR * gxR + gyR * gyR + gxG * gxG + gyG * gyG + gxB * gxB + gyB * gyB) / 3.0);
-                }
-            }
-
-            bool[,] isBg = new bool[PATCH_SIZE, PATCH_SIZE];
-            var queue = new Queue<(int x, int y)>(256);
-
-            double ColorDistToBg(int x, int y)
-            {
-                double dr = rGrid[y, x] - bgR;
-                double dg = gGrid[y, x] - bgG;
-                double db = bGrid[y, x] - bgB;
-                return Math.Sqrt(dr * dr + dg * dg + db * db);
-            }
-
-            void TrySeed(int x, int y)
-            {
-                if (isBg[y, x]) return;
-                if (ColorDistToBg(x, y) < 42.0 && gradGrid[y, x] < 32.0)
-                {
-                    isBg[y, x] = true;
-                    queue.Enqueue((x, y));
-                }
-            }
-
-            for (int i = 0; i < PATCH_SIZE; i++)
-            {
-                TrySeed(i, 0);
-                TrySeed(i, PATCH_SIZE - 1);
-                TrySeed(0, i);
-                TrySeed(PATCH_SIZE - 1, i);
-            }
-
-            int[] dx4 = { 1, -1, 0, 0 };
-            int[] dy4 = { 0, 0, 1, -1 };
-
-            while (queue.Count > 0)
-            {
-                var (cx, cy) = queue.Dequeue();
-                for (int d = 0; d < 4; d++)
-                {
-                    int nx = cx + dx4[d];
-                    int ny = cy + dy4[d];
-                    if (nx < 0 || nx >= PATCH_SIZE || ny < 0 || ny >= PATCH_SIZE || isBg[ny, nx])
-                        continue;
-
-                    if (ColorDistToBg(nx, ny) < 38.0 && gradGrid[ny, nx] < 26.0)
-                    {
-                        isBg[ny, nx] = true;
-                        queue.Enqueue((nx, ny));
-                    }
-                }
-            }
-
-            bool[,] rawFg = new bool[PATCH_SIZE, PATCH_SIZE];
-            for (int y = 0; y < PATCH_SIZE; y++)
-            {
-                for (int x = 0; x < PATCH_SIZE; x++)
-                {
-                    rawFg[y, x] = !isBg[y, x] || ColorDistToBg(x, y) > 48.0;
-                }
-            }
-
-            bool[,] pieceMask = new bool[PATCH_SIZE, PATCH_SIZE];
-            for (int y = 7; y <= 25; y++)
-            {
-                for (int x = 7; x <= 24; x++)
-                {
-                    if (rawFg[y, x] && !pieceMask[y, x])
-                    {
-                        pieceMask[y, x] = true;
-                        queue.Enqueue((x, y));
-                    }
-                }
-            }
-
-            while (queue.Count > 0)
-            {
-                var (cx, cy) = queue.Dequeue();
-                for (int d = 0; d < 4; d++)
-                {
-                    int nx = cx + dx4[d];
-                    int ny = cy + dy4[d];
-                    if (nx < 0 || nx >= PATCH_SIZE || ny < 0 || ny >= PATCH_SIZE)
-                        continue;
-                    if (rawFg[ny, nx] && !pieceMask[ny, nx])
-                    {
-                        pieceMask[ny, nx] = true;
-                        queue.Enqueue((nx, ny));
-                    }
-                }
-            }
-
-            int len = PATCH_SIZE * PATCH_SIZE;
-            double[] edgeVec = new double[len];
-            double[] maskVec = new double[len];
-            var fgLumas = new List<double>(300);
-            int fgCount = 0;
-
-            for (int y = 0; y < PATCH_SIZE; y++)
-            {
-                for (int x = 0; x < PATCH_SIZE; x++)
-                {
-                    int idx = y * PATCH_SIZE + x;
-                    bool inPiece = pieceMask[y, x];
-                    bool nearPiece = inPiece
-                        || (x > 0 && pieceMask[y, x - 1])
-                        || (x < PATCH_SIZE - 1 && pieceMask[y, x + 1])
-                        || (y > 0 && pieceMask[y - 1, x])
-                        || (y < PATCH_SIZE - 1 && pieceMask[y + 1, x]);
-
-                    edgeVec[idx] = nearPiece ? gradGrid[y, x] : 0.0;
-                    maskVec[idx] = inPiece ? 1.0 : 0.0;
-
-                    if (inPiece)
-                    {
-                        fgCount++;
-                        fgLumas.Add(lumaGrid[y, x]);
-                    }
-                }
-            }
-
-            double edgeMean = edgeVec.Average();
-            double edgeStd = Math.Sqrt(edgeVec.Sum(v => (v - edgeMean) * (v - edgeMean)) / len);
-            double[] edgeNorm = new double[len];
-            if (edgeStd > 1.0)
-            {
-                for (int i = 0; i < len; i++)
-                    edgeNorm[i] = (edgeVec[i] - edgeMean) / edgeStd;
-            }
-
-            double maskMean = maskVec.Average();
-            double maskStd = Math.Sqrt(maskVec.Sum(v => (v - maskMean) * (v - maskMean)) / len);
-            double[] maskNorm = new double[len];
-            if (maskStd > 0.01)
-            {
-                for (int i = 0; i < len; i++)
-                    maskNorm[i] = (maskVec[i] - maskMean) / maskStd;
-            }
-
-            fgLumas.Sort();
-            double coreLuma = fgLumas.Count > 0
-                ? fgLumas[(int)(fgLumas.Count * 0.65)]
-                : 128.0;
-
-            return new PieceTemplate
-            {
-                EdgePatch = edgeNorm,
-                MaskPatch = maskNorm,
-                PieceLuma = coreLuma,
-                RawContrast = edgeStd,
-                ForegroundPixels = fgCount,
-                IsWhite = coreLuma >= _whiteBlackThreshold
-            };
-        }
-
-        private static double ComputeShiftSimilarity(PieceTemplate a, PieceTemplate b)
-        {
-            double[] ae = a.EdgePatch;
-            double[] be = b.EdgePatch;
-            double[] am = a.MaskPatch;
-            double[] bm = b.MaskPatch;
-            int expectedLen = PATCH_SIZE * PATCH_SIZE;
-            if (ae.Length != expectedLen || be.Length != expectedLen || am.Length != expectedLen || bm.Length != expectedLen)
-                return -1.0;
-
-            double bestScore = -1.0;
-            const double invCount = 1.0 / (30.0 * 30.0);
-
-            for (int dy = -1; dy <= 1; dy++)
-            {
-                for (int dx = -1; dx <= 1; dx++)
-                {
-                    double edgeDot = 0.0;
-                    double maskDot = 0.0;
-
-                    for (int y = 1; y < PATCH_SIZE - 1; y++)
-                    {
-                        int rowA = y * PATCH_SIZE;
-                        int rowB = (y + dy) * PATCH_SIZE + dx;
-                        for (int x = 1; x < PATCH_SIZE - 1; x++)
-                        {
-                            int ia = rowA + x;
-                            int ib = rowB + x;
-                            edgeDot += ae[ia] * be[ib];
-                            maskDot += am[ia] * bm[ib];
-                        }
-                    }
-
-                    double score = 0.62 * (edgeDot * invCount) + 0.38 * (maskDot * invCount);
-                    if (score > bestScore)
-                        bestScore = score;
-                }
-            }
-
-            return bestScore;
-        }
-
-        private static (char piece, double confidence, double[] scores) RecognizeCellFull(
-            PieceTemplate tpl,
-            Dictionary<char, List<PieceTemplate>> signatures,
-            double whiteBlackThreshold)
-        {
-            double[] scores = { -1.0, -1.0, -1.0, -1.0, -1.0, -1.0 };
-            if (!IsCellOccupied(tpl))
-                return ('1', 0.0, scores);
-
-            bool isWhite = tpl.PieceLuma >= whiteBlackThreshold;
-            char bestPiece = '1';
-            double bestScore = -1.0;
-
-            for (int idx = 0; idx < PieceTypesUpper.Length; idx++)
-            {
-                char key = isWhite ? PieceTypesUpper[idx] : char.ToLower(PieceTypesUpper[idx]);
-                if (!signatures.TryGetValue(key, out var samples))
-                    continue;
-
-                double maxSim = -1.0;
-                foreach (var sample in samples)
-                {
-                    double sim = ComputeShiftSimilarity(tpl, sample);
-                    if (sim > maxSim)
-                        maxSim = sim;
-                }
-
-                scores[idx] = maxSim;
-                if (maxSim > bestScore)
-                {
-                    bestScore = maxSim;
-                    bestPiece = key;
-                }
-            }
-
-            if (bestScore < 0.24)
-                return ('1', 0.0, scores);
-
-            return (bestPiece, bestScore, scores);
-        }
-
-        private static char BestPieceFromScores(double[] scores, bool isWhite, bool allowPawn, bool allowKing)
-        {
-            int bestIdx = -1;
-            double bestVal = double.NegativeInfinity;
-
-            for (int i = 0; i < 6; i++)
-            {
-                if (!allowPawn && i == 0) continue;
-                if (!allowKing && i == 5) continue;
-                if (scores[i] > bestVal)
-                {
-                    bestVal = scores[i];
-                    bestIdx = i;
-                }
-            }
-
-            if (bestIdx < 0) bestIdx = 4;
-            char upper = PieceTypesUpper[bestIdx];
-            return isWhite ? upper : char.ToLower(upper);
-        }
-
-        private (char[,] grid, Point? lockedWhiteKing, Point? lockedBlackKing) StabilizeGridWithTracking(char[,] rawGrid)
-        {
-            if (_confirmedGrid == null)
-                return ((char[,])rawGrid.Clone(), null, null);
-
-            char[,] stabilized = (char[,])rawGrid.Clone();
-            Point? lockedWK = null;
-            Point? lockedBK = null;
-
-            var departed = new List<(int r, int c, char piece)>();
-            var arrived = new List<(int r, int c, char detectedPiece)>();
-
-            for (int r = 0; r < 8; r++)
-            {
-                for (int c = 0; c < 8; c++)
-                {
-                    char oldP = _confirmedGrid[r, c];
-                    char newP = rawGrid[r, c];
-
-                    if (oldP == newP)
-                    {
-                        if (oldP == 'K') lockedWK = new Point(c, r);
-                        if (oldP == 'k') lockedBK = new Point(c, r);
-                        continue;
-                    }
-
-                    if (oldP != '1' && newP == '1')
-                    {
-                        departed.Add((r, c, oldP));
-                    }
-                    else if (oldP == '1' && newP != '1')
-                    {
-                        arrived.Add((r, c, newP));
-                    }
-                    else if (oldP != '1' && newP != '1')
-                    {
-                        if (oldP == 'K' || oldP == 'k')
-                        {
-                            stabilized[r, c] = oldP;
-                            if (oldP == 'K') lockedWK = new Point(c, r);
-                            if (oldP == 'k') lockedBK = new Point(c, r);
-                        }
-                        else if (char.IsUpper(oldP) == char.IsUpper(newP))
-                        {
-                            stabilized[r, c] = oldP;
-                        }
-                        else
-                        {
-                            arrived.Add((r, c, newP));
-                        }
-                    }
-                }
-            }
-
-            if (departed.Count == 1 && arrived.Count == 1)
-            {
-                char movedPiece = departed[0].piece;
-                bool isPromotion = char.ToUpper(movedPiece) == 'P' && (arrived[0].r == 0 || arrived[0].r == 7);
-
-                if (!isPromotion)
-                {
-                    stabilized[arrived[0].r, arrived[0].c] = movedPiece;
-                    if (movedPiece == 'K') lockedWK = new Point(arrived[0].c, arrived[0].r);
-                    if (movedPiece == 'k') lockedBK = new Point(arrived[0].c, arrived[0].r);
-                }
-            }
-            else if (departed.Count == 2 && arrived.Count == 1)
-            {
-                var attackingPawn = departed.FirstOrDefault(d => char.IsUpper(d.piece) == char.IsUpper(arrived[0].detectedPiece));
-                if (attackingPawn.piece != '\0' && char.ToUpper(attackingPawn.piece) == 'P')
-                {
-                    stabilized[arrived[0].r, arrived[0].c] = attackingPawn.piece;
-                }
-            }
-            else if (departed.Count == 2 && arrived.Count == 2)
-            {
-                var kingDep = departed.FirstOrDefault(d => char.ToUpper(d.piece) == 'K');
-                var rookDep = departed.FirstOrDefault(d => char.ToUpper(d.piece) == 'R');
-                if (kingDep.piece != '\0' && rookDep.piece != '\0')
-                {
-                    foreach (var arr in arrived)
-                    {
-                        if (arr.c == 2 || arr.c == 6)
-                        {
-                            stabilized[arr.r, arr.c] = kingDep.piece;
-                            if (kingDep.piece == 'K') lockedWK = new Point(arr.c, arr.r);
-                            if (kingDep.piece == 'k') lockedBK = new Point(arr.c, arr.r);
-                        }
-                        else if (arr.c == 3 || arr.c == 5)
-                        {
-                            stabilized[arr.r, arr.c] = rookDep.piece;
-                        }
-                    }
-                }
-            }
-
-            return (stabilized, lockedWK, lockedBK);
-        }
-
-        private static string GridToFen(char[,] grid)
-        {
-            StringBuilder sb = new();
-            for (int r = 0; r < 8; r++)
-            {
-                int emptyCount = 0;
-                for (int c = 0; c < 8; c++)
-                {
-                    if (grid[r, c] == '1') emptyCount++;
-                    else
-                    {
-                        if (emptyCount > 0) { sb.Append(emptyCount); emptyCount = 0; }
-                        sb.Append(grid[r, c]);
-                    }
-                }
-                if (emptyCount > 0) sb.Append(emptyCount);
-                if (r < 7) sb.Append('/');
-            }
-            return sb.ToString();
-        }
-
-        private Dictionary<char, List<PieceTemplate>> SnapshotSignatures()
-        {
-            return _pieceSignatures.ToDictionary(
-                kv => kv.Key,
-                kv => kv.Value.ToList()
-            );
         }
 
         private async Task ScanAndSuggestAsync(bool forceCalculate = false)
@@ -1357,9 +797,6 @@ namespace ChGhost
 
             _isScanning = true;
             bool playAsBlackSnap = _playAsBlack;
-            double wbThresholdSnap = _whiteBlackThreshold;
-            var signaturesSnap = SnapshotSignatures();
-
             try
             {
                 bool ready = await Task.Run(EnsureStockfishRunning);
@@ -1369,140 +806,51 @@ namespace ChGhost
                     return;
                 }
 
-                var scanResult = await Task.Run(() =>
+                BoardRecognitionResult recognition = await Task.Run(() =>
                 {
                     using Bitmap bmp = CaptureBoard();
-                    char[,] grid = new char[8, 8];
-                    double[,][] scoreMatrix = new double[8, 8][];
-                    var activeCells = new List<(int r, int c, double score)>();
-
-                    for (int r = 0; r < 8; r++)
-                    {
-                        for (int c = 0; c < 8; c++)
-                        {
-                            int boardR = playAsBlackSnap ? 7 - r : r;
-                            int boardC = playAsBlackSnap ? 7 - c : c;
-                            var tpl = ExtractPieceTemplate32x32(bmp, r, c);
-                            var res = RecognizeCellFull(tpl, signaturesSnap, wbThresholdSnap);
-
-                            grid[boardR, boardC] = res.piece;
-                            scoreMatrix[boardR, boardC] = res.scores;
-
-                            if (res.piece != '1')
-                                activeCells.Add((boardR, boardC, res.confidence));
-                        }
-                    }
-
-                    if (activeCells.Count > 32)
-                    {
-                        var toDrop = activeCells.OrderBy(x => x.score).Take(activeCells.Count - 32);
-                        foreach (var d in toDrop)
-                            grid[d.r, d.c] = '1';
-                    }
-
-                    return (rawFen: GridToFen(grid), grid: grid, scores: scoreMatrix);
+                    return _recognizer.Recognize(bmp, playAsBlackSnap);
                 });
 
-                if (!forceCalculate && scanResult.rawFen != _lastRawFen)
-                {
-                    _lastRawFen = scanResult.rawFen;
+                TrackingUpdate tracking = _gameStateTracker.Update(recognition, forceCalculate, playAsBlackSnap);
+                if (tracking.IsDebounced)
                     return;
-                }
-                _lastRawFen = scanResult.rawFen;
 
-                var tracked = StabilizeGridWithTracking(scanResult.grid);
-                char[,] stableGrid = tracked.grid;
-
-                for (int c = 0; c < 8; c++)
+                if (!tracking.IsValid)
                 {
-                    if (stableGrid[0, c] == 'P')
-                        stableGrid[0, c] = BestPieceFromScores(scanResult.scores[0, c], isWhite: true, allowPawn: false, allowKing: true);
-                    if (stableGrid[0, c] == 'p')
-                        stableGrid[0, c] = BestPieceFromScores(scanResult.scores[0, c], isWhite: false, allowPawn: false, allowKing: true);
-                    if (stableGrid[7, c] == 'P')
-                        stableGrid[7, c] = BestPieceFromScores(scanResult.scores[7, c], isWhite: true, allowPawn: false, allowKing: true);
-                    if (stableGrid[7, c] == 'p')
-                        stableGrid[7, c] = BestPieceFromScores(scanResult.scores[7, c], isWhite: false, allowPawn: false, allowKing: true);
-                }
-
-                EnforceKingConstraint(stableGrid, scanResult.scores, isWhite: true, lockedKing: tracked.lockedWhiteKing);
-                EnforceKingConstraint(stableGrid, scanResult.scores, isWhite: false, lockedKing: tracked.lockedBlackKing);
-                EnforcePawnCap(stableGrid, scanResult.scores, isWhite: true);
-                EnforcePawnCap(stableGrid, scanResult.scores, isWhite: false);
-
-                int whiteKings = 0, blackKings = 0;
-                for (int r = 0; r < 8; r++)
-                    for (int c = 0; c < 8; c++)
-                    {
-                        if (stableGrid[r, c] == 'K') whiteKings++;
-                        if (stableGrid[r, c] == 'k') blackKings++;
-                    }
-
-                if (whiteKings != 1 || blackKings != 1)
-                {
-                    _debugInfo = $"Не вижу королей (Б={whiteKings}, Ч={blackKings}). Нажмите Alt+3 для пересчёта.";
+                    _debugInfo = $"Не вижу королей (Б={tracking.WhiteKings}, Ч={tracking.BlackKings}). Нажмите Alt+3 для пересчёта.";
                     UpdateUI();
                     return;
                 }
 
-                string stableFen = GridToFen(stableGrid);
+                char[,] stableGrid = tracking.Grid;
                 _currentGrid = stableGrid;
                 _debugInfo = "";
 
-                if (!forceCalculate && stableFen == _lastStableFen)
+                if (tracking.IsUnchanged)
                 {
                     RedrawOverlay();
                     return;
                 }
 
-                bool isMyTurn = true;
-                if (!forceCalculate && _confirmedGrid != null)
+                if (tracking.IsWaitingForOpponent)
                 {
-                    bool opponentMoved = false;
-                    bool iMoved = false;
-
-                    for (int r = 0; r < 8; r++)
-                    {
-                        for (int c = 0; c < 8; c++)
-                        {
-                            char oldCell = _confirmedGrid[r, c];
-                            char newCell = stableGrid[r, c];
-                            if (oldCell != newCell && newCell != '1')
-                            {
-                                bool isWhitePiece = char.IsUpper(newCell);
-                                bool isMyPiece = playAsBlackSnap ? !isWhitePiece : isWhitePiece;
-                                if (isMyPiece) iMoved = true;
-                                else opponentMoved = true;
-                            }
-                        }
-                    }
-
-                    if (iMoved && !opponentMoved)
-                    {
-                        _lastStableFen = stableFen;
-                        _confirmedGrid = stableGrid;
-                        _lastBestMove = "";
-                        _lastMoveRussianText = "";
-                        _lastMoveIsCastling = false;
-                        RedrawOverlay();
-                        UpdateUI("Жду хода соперника... (Alt+3: если соперник уже сходил)");
-                        return;
-                    }
-                    isMyTurn = opponentMoved || (!iMoved && !opponentMoved);
+                    _lastBestMove = "";
+                    _lastMoveRussianText = "";
+                    _lastMoveIsCastling = false;
+                    RedrawOverlay();
+                    UpdateUI("Жду хода соперника... (Alt+3: если соперник уже сходил)");
+                    return;
                 }
 
-                _lastStableFen = stableFen;
-                _confirmedGrid = stableGrid;
-
-                if (!isMyTurn)
+                if (!tracking.ShouldCalculateMove)
                 {
                     RedrawOverlay();
                     return;
                 }
 
                 char turn = playAsBlackSnap ? 'b' : 'w';
-                string castlingRights = DetectCastlingRights(stableGrid);
-                string fullFen = $"{stableFen} {turn} {castlingRights} - 0 1";
+                string fullFen = $"{tracking.StableFen} {turn} {tracking.CastlingRights} - 0 1";
                 int moveTimeMs = _isBlitzTurboMode ? 180 : 550;
 
                 string bestMove = await Task.Run(() => QueryStockfish(fullFen, moveTimeMs));
@@ -1534,12 +882,10 @@ namespace ChGhost
                         string pieceRus = GetRussianPieceFull(movingPiece);
                         string fromSq = bestMove.Substring(0, 2);
                         string toSq = bestMove.Substring(2, 2);
-
                         string promoSuffix = "";
                         if (bestMove.Length >= 5)
                             promoSuffix = $"={GetRussianPieceShort(bestMove[4])}";
-
-                        _lastMoveRussianText = $"{pieceRus} {fromSq} → {toSq}{promoSuffix}";
+                        _lastMoveRussianText = $"{pieceRus} {fromSq} ? {toSq}{promoSuffix}";
                     }
 
                     RedrawOverlay();
@@ -1551,117 +897,6 @@ namespace ChGhost
                 _isScanning = false;
             }
         }
-
-        private static void EnforceKingConstraint(char[,] grid, double[,][] scores, bool isWhite, Point? lockedKing)
-        {
-            char kingChar = isWhite ? 'K' : 'k';
-
-            if (lockedKing.HasValue)
-            {
-                int kr = lockedKing.Value.Y;
-                int kc = lockedKing.Value.X;
-                for (int r = 0; r < 8; r++)
-                {
-                    for (int c = 0; c < 8; c++)
-                    {
-                        if (r == kr && c == kc)
-                            grid[r, c] = kingChar;
-                        else if (grid[r, c] == kingChar)
-                            grid[r, c] = BestPieceFromScores(scores[r, c], isWhite, allowPawn: r > 0 && r < 7, allowKing: false);
-                    }
-                }
-                return;
-            }
-
-            var kings = new List<(int r, int c, double score, double margin)>();
-            var sameColor = new List<(int r, int c, double kingScore)>();
-
-            for (int r = 0; r < 8; r++)
-            {
-                for (int c = 0; c < 8; c++)
-                {
-                    char p = grid[r, c];
-                    if (p == '1' || char.IsUpper(p) != isWhite) continue;
-
-                    double kScore = scores[r, c][5];
-                    sameColor.Add((r, c, kScore));
-
-                    if (p == kingChar)
-                    {
-                        double bestOther = -1.0;
-                        for (int i = 0; i < 5; i++)
-                        {
-                            if ((r == 0 || r == 7) && i == 0) continue;
-                            if (scores[r, c][i] > bestOther) bestOther = scores[r, c][i];
-                        }
-                        kings.Add((r, c, kScore, kScore - bestOther));
-                    }
-                }
-            }
-
-            if (kings.Count == 0 && sameColor.Count > 0)
-            {
-                var best = sameColor.OrderByDescending(x => x.kingScore).First();
-                grid[best.r, best.c] = kingChar;
-            }
-            else if (kings.Count > 1)
-            {
-                var ordered = kings.OrderByDescending(x => x.margin).ThenByDescending(x => x.score).ToList();
-                for (int i = 1; i < ordered.Count; i++)
-                {
-                    int rr = ordered[i].r;
-                    int cc = ordered[i].c;
-                    grid[rr, cc] = BestPieceFromScores(scores[rr, cc], isWhite, allowPawn: rr > 0 && rr < 7, allowKing: false);
-                }
-            }
-        }
-
-        private static void EnforcePawnCap(char[,] grid, double[,][] scores, bool isWhite)
-        {
-            char pawnChar = isWhite ? 'P' : 'p';
-            var pawns = new List<(int r, int c, double margin)>();
-
-            for (int r = 1; r < 7; r++)
-            {
-                for (int c = 0; c < 8; c++)
-                {
-                    if (grid[r, c] != pawnChar) continue;
-                    double pScore = scores[r, c][0];
-                    double bestNonPawn = -1.0;
-                    for (int i = 1; i < 5; i++)
-                    {
-                        if (scores[r, c][i] > bestNonPawn) bestNonPawn = scores[r, c][i];
-                    }
-                    pawns.Add((r, c, pScore - bestNonPawn));
-                }
-            }
-
-            if (pawns.Count > 8)
-            {
-                var excess = pawns.OrderBy(x => x.margin).Take(pawns.Count - 8);
-                foreach (var item in excess)
-                {
-                    grid[item.r, item.c] = BestPieceFromScores(scores[item.r, item.c], isWhite, allowPawn: false, allowKing: false);
-                }
-            }
-        }
-
-        private static string DetectCastlingRights(char[,] grid)
-        {
-            StringBuilder rights = new();
-            if (grid[7, 4] == 'K')
-            {
-                if (grid[7, 7] == 'R') rights.Append('K');
-                if (grid[7, 0] == 'R') rights.Append('Q');
-            }
-            if (grid[0, 4] == 'k')
-            {
-                if (grid[0, 7] == 'r') rights.Append('k');
-                if (grid[0, 0] == 'r') rights.Append('q');
-            }
-            return rights.Length > 0 ? rights.ToString() : "-";
-        }
-
         private string QueryStockfish(string fen, int moveTimeMs)
         {
             lock (_sfLock)
@@ -1843,7 +1078,7 @@ namespace ChGhost
         protected override void OnClosed(EventArgs e)
         {
             IntPtr hwnd = new WindowInteropHelper(this).Handle;
-            for (int i = 1; i <= 15; i++) UnregisterHotKey(hwnd, i);
+            for (int i = 1; i <= 16; i++) UnregisterHotKey(hwnd, i);
 
             _scanTimer.Stop();
             KillStockfish();
