@@ -19,7 +19,7 @@ public class SettingsStoreTests
         Assert.True(File.Exists(path));
         Assert.Equal(4, settings.EngineThreads);
         Assert.Equal(4, settings.EffectiveEngineThreads);
-        Assert.Equal(128, settings.EngineHashMb);
+        Assert.Equal(64, settings.EngineHashMb);
         Assert.Equal(120, settings.ScanIntervalBlitzMs);
         Assert.Equal(2600, settings.TargetElo);
         Assert.Equal("Auto", settings.RecognizerMode);
@@ -57,7 +57,7 @@ public class SettingsStoreTests
 
         AppSettings settings = new SettingsStore(path, logger).Load();
 
-        Assert.Equal(128, settings.EngineHashMb);
+        Assert.Equal(64, settings.EngineHashMb);
         Assert.Equal(2600, settings.TargetElo);
         Assert.NotEmpty(logger.Errors);
         Assert.True(JsonDocument.Parse(File.ReadAllText(path)).RootElement.ValueKind == JsonValueKind.Object);

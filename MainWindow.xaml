@@ -1,7 +1,7 @@
 ﻿<Window x:Class="ChGhost.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="SystemHelper"
+        Title=""
         WindowStyle="None"
         AllowsTransparency="True"
         Background="Transparent"
@@ -22,7 +22,7 @@
                 <Border Height="1" Background="#33FFFFFF" Margin="0,2,0,6"/>
                 <TextBlock x:Name="HotkeysText" Foreground="#99AAB5"
                            FontFamily="Consolas" FontSize="11"
-                           Text="Alt+1/2: углы | Alt+F: авто | Alt+3: старт | Alt+4: правка | Alt+5: сброс&#x0a;Alt+S: старт/пауза | Alt+C: цвет | Alt+H: скрыть | Alt+Q: выход"/>
+                           Text="Alt+1/2: углы | Alt+F: авто | Alt+3: старт | Alt+4: правка | Alt+5: сброс&#x0a;Alt+H: стелс | Alt+G: скрыть | Alt+S: старт/пауза | Alt+C: цвет | Alt+Q: выход"/>
             </StackPanel>
         </Border>
     </Canvas>

@@ -5,7 +5,7 @@ namespace ChGhost.Core.Models;
 public sealed class AppSettings
 {
     public int EngineThreads { get; set; } = 4;
-    public int EngineHashMb { get; set; } = 128;
+    public int EngineHashMb { get; set; } = 64;
     public int TargetElo { get; set; } = 2600;
     public bool FullStrength { get; set; } = true;
     public int MoveTimeBlitzMs { get; set; } = 180;
@@ -15,6 +15,20 @@ public sealed class AppSettings
     public int CommandTimeoutMs { get; set; } = 3500;
     public string RecognizerMode { get; set; } = "Auto";
     public string OnnxModelPath { get; set; } = "models/pieces_64x64.onnx";
+    public string EngineExecutablePath { get; set; } = "stockfish.exe";
+    public int EngineIdleUnloadSeconds { get; set; } = 90;
+    public bool ExcludeFromCapture { get; set; } = true;
+    public bool StealthHumanize { get; set; } = true;
+    public int MultiPvCount { get; set; } = 4;
+    public int HumanMaxCpLoss { get; set; } = 45;
+    public double HumanTemperature { get; set; } = 32.0;
+    public bool ShowAdvisorArrows { get; set; } = true;
+    public int AdvisorMaxGapCp { get; set; } = 65;
+    public bool HumanPacingEnabled { get; set; } = true;
+    public int HumanDelayBlitzMinMs { get; set; } = 120;
+    public int HumanDelayBlitzMaxMs { get; set; } = 950;
+    public int HumanDelayRapidMinMs { get; set; } = 400;
+    public int HumanDelayRapidMaxMs { get; set; } = 2600;
 
     [JsonIgnore]
     public int EffectiveEngineThreads => EngineThreads == 0
@@ -24,7 +38,7 @@ public sealed class AppSettings
     public static AppSettings CreateDefaults() => new()
     {
         EngineThreads = 4,
-        EngineHashMb = 128,
+        EngineHashMb = 64,
         TargetElo = 2600,
         FullStrength = true,
         MoveTimeBlitzMs = 180,
@@ -34,6 +48,20 @@ public sealed class AppSettings
         CommandTimeoutMs = 3500
         , RecognizerMode = "Auto"
         , OnnxModelPath = "models/pieces_64x64.onnx"
+        , EngineExecutablePath = "stockfish.exe"
+        , EngineIdleUnloadSeconds = 90
+        , ExcludeFromCapture = true
+        , StealthHumanize = true
+        , MultiPvCount = 4
+        , HumanMaxCpLoss = 45
+        , HumanTemperature = 32.0
+        , ShowAdvisorArrows = true
+        , AdvisorMaxGapCp = 65
+        , HumanPacingEnabled = true
+        , HumanDelayBlitzMinMs = 120
+        , HumanDelayBlitzMaxMs = 950
+        , HumanDelayRapidMinMs = 400
+        , HumanDelayRapidMaxMs = 2600
     };
 
     public AppSettings Normalize()
@@ -55,6 +83,18 @@ public sealed class AppSettings
         OnnxModelPath = string.IsNullOrWhiteSpace(OnnxModelPath)
             ? "models/pieces_64x64.onnx"
             : OnnxModelPath.Trim();
+        EngineExecutablePath = string.IsNullOrWhiteSpace(EngineExecutablePath)
+            ? "stockfish.exe"
+            : EngineExecutablePath.Trim();
+        EngineIdleUnloadSeconds = Math.Clamp(EngineIdleUnloadSeconds, 0, 86_400);
+        MultiPvCount = Math.Clamp(MultiPvCount, 1, 6);
+        HumanMaxCpLoss = Math.Clamp(HumanMaxCpLoss, 0, 2_000);
+        HumanTemperature = Math.Clamp(HumanTemperature, 8.0, 256.0);
+        AdvisorMaxGapCp = Math.Clamp(AdvisorMaxGapCp, 0, 2_000);
+        HumanDelayBlitzMinMs = Math.Clamp(HumanDelayBlitzMinMs, 0, 60_000);
+        HumanDelayBlitzMaxMs = Math.Clamp(HumanDelayBlitzMaxMs, HumanDelayBlitzMinMs, 60_000);
+        HumanDelayRapidMinMs = Math.Clamp(HumanDelayRapidMinMs, 0, 60_000);
+        HumanDelayRapidMaxMs = Math.Clamp(HumanDelayRapidMaxMs, HumanDelayRapidMinMs, 60_000);
         return this;
     }
 }

@@ -33,8 +33,10 @@ namespace ChGhost
         private readonly IAppLogger _logger;
         private readonly SettingsStore _settingsStore;
         private readonly AppSettings _settings;
+        private readonly string _enginePath;
         private readonly IChessEngine _engine;
         private readonly CancellationTokenSource _appLifetime = new();
+        private readonly Random _rng = new();
         private int _activeProfile = 1;
         private readonly IBoardRecognizer _recognizer;
         private readonly IBoardDetector _boardDetector = new ManualBoardDetector();
@@ -83,6 +85,9 @@ namespace ChGhost
 
         private char[,]? _currentGrid = null;
         private bool _isScanning = false;
+        private Bitmap? _captureBitmap;
+        private CancellationTokenSource? _humanDelayCts;
+        private readonly List<string> _advisorMoves = new();
 
         public MainWindow()
         {
@@ -91,10 +96,8 @@ namespace ChGhost
             _settingsStore = new SettingsStore(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json"), _logger);
             _settings = _settingsStore.Load();
             _recognizer = CreateRecognizer();
-            _engine = new StockfishEngine(
-                System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "stockfish.exe"),
-                _settings,
-                _logger);
+            _enginePath = ResolveEnginePath(_settings.EngineExecutablePath);
+            _engine = new StockfishEngine(_enginePath, _settings, _logger);
             InitializeComponent();
             LoadConfig();
             UpdateUI();
@@ -132,6 +135,13 @@ namespace ChGhost
 
         private string GetActiveDbFileName() => $"board_auto_v13_p{_activeProfile}.json";
 
+        private string ResolveEnginePath(string configured)
+        {
+            if (System.IO.Path.IsPathRooted(configured))
+                return configured;
+            return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, configured);
+        }
+
         private void ApplySpeedPreset()
         {
             _scanTimer.Interval = _isBlitzTurboMode
@@ -144,9 +154,6 @@ namespace ChGhost
             base.OnSourceInitialized(e);
             IntPtr hwnd = new WindowInteropHelper(this).Handle;
 
-            if (!Win32Interop.TrySetWindowDisplayAffinity(hwnd, Win32Interop.WdaExcludeFromCapture, out int affinityError))
-                _logger.Warn($"SetWindowDisplayAffinity failed with Win32 error {affinityError}.");
-
             int exStyle = Win32Interop.GetWindowLong(hwnd, Win32Interop.GwlExStyle);
             if (!Win32Interop.TrySetWindowLong(
                     hwnd,
@@ -154,6 +161,18 @@ namespace ChGhost
                     exStyle | Win32Interop.WsExLayered | Win32Interop.WsExTransparent,
                     out int styleError))
                 _logger.Warn($"SetWindowLong failed with Win32 error {styleError}.");
+            Win32Interop.ApplyNoActivateToolStyle(hwnd);
+
+            if (_settings.ExcludeFromCapture)
+            {
+                if (!Win32Interop.TrySetExcludeFromCapture(hwnd, true))
+                    _logger.Warn("SetWindowDisplayAffinity exclude-from-capture failed.");
+            }
+            else
+            {
+                _logger.Warn("ExcludeFromCapture disabled in settings; overlay may appear in screenshots.");
+                Win32Interop.TrySetExcludeFromCapture(hwnd, false);
+            }
 
             RegisterHotKeys(hwnd);
 
@@ -169,7 +188,7 @@ namespace ChGhost
                 (4, 0x34, "Alt+4"), (5, 0x35, "Alt+5"), (6, 0x53, "Alt+S"),
                 (7, 0x43, "Alt+C"), (8, 0x48, "Alt+H"), (9, 0x51, "Alt+Q"),
                 (10, 0x52, "Alt+R"), (11, 0x44, "Alt+D"), (12, 0x46, "Alt+F"),
-                (14, 0x42, "Alt+B"), (15, 0x45, "Alt+E"), (16, 0x50, "Alt+P")
+                (13, 0x47, "Alt+G"), (14, 0x42, "Alt+B"), (15, 0x45, "Alt+E"), (16, 0x50, "Alt+P")
             };
             var failed = new List<string>();
             foreach (var hotkey in hotkeys)
@@ -262,8 +281,18 @@ namespace ChGhost
                         break;
 
                     case 8:
-                        _isHidden = !_isHidden;
-                        OverlayCanvas.Visibility = _isHidden ? Visibility.Hidden : Visibility.Visible;
+                        _settings.StealthHumanize = !_settings.StealthHumanize;
+                        try
+                        {
+                            _settingsStore.Save(_settings);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+                        {
+                            _logger.Error("Unable to save settings after changing stealth mode.", ex);
+                            _startupWarning = "Не удалось сохранить настройки.";
+                        }
+                        _logger.Info($"StealthHumanize={_settings.StealthHumanize}");
+                        UpdateUI($"StealthHumanize: {(_settings.StealthHumanize ? "ON" : "OFF")}");
                         break;
 
                     case 9:
@@ -287,6 +316,11 @@ namespace ChGhost
                             TryAutoDetectBoard();
                         else
                             ManualFixPieceAtCursor(cursor);
+                        break;
+
+                    case 13:
+                        _isHidden = !_isHidden;
+                        OverlayCanvas.Visibility = _isHidden ? Visibility.Hidden : Visibility.Visible;
                         break;
 
                     case 14:
@@ -380,7 +414,7 @@ namespace ChGhost
                 try
                 {
                     onnxRec.InvalidateCache();
-                    using Bitmap boardBmp = CaptureBoard();
+                    using Bitmap boardBmp = CaptureBoardSnapshot();
                     BoardRecognitionResult recognition = onnxRec.Recognize(boardBmp, _playAsBlack);
                     bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlack(recognition.RawGrid, _playAsBlack);
                     if (detected.HasValue)
@@ -436,7 +470,7 @@ namespace ChGhost
             if (!HasValidSignatures())
                 LoadConfig();
 
-            using Bitmap boardBmp = CaptureBoard();
+            using Bitmap boardBmp = CaptureBoardSnapshot();
             ICalibratableRecognizer calibratable = CalibratableRecognizer
                 ?? throw new InvalidOperationException("Template calibratable recognizer is unavailable.");
             CalibrationOutcome calibration = calibratable.CalibrateStartingPosition(boardBmp, _playAsBlack);
@@ -483,7 +517,7 @@ namespace ChGhost
             try
             {
                 onnxRecognizer.InvalidateCache();
-                using Bitmap boardBmp = CaptureBoard();
+                using Bitmap boardBmp = CaptureBoardSnapshot();
                 BoardRecognitionResult recognition = onnxRecognizer.Recognize(boardBmp, _playAsBlack);
                 bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlack(recognition.RawGrid, _playAsBlack);
                 if (!detected.HasValue)
@@ -536,7 +570,7 @@ namespace ChGhost
             char targetFen = _manualFixOrder[_fixIndex].fen;
             string savedName = _manualFixOrder[_fixIndex].name;
 
-            using Bitmap boardBmp = CaptureBoard();
+            using Bitmap boardBmp = CaptureBoardSnapshot();
             calibratable.CalibratePiece(boardBmp, new Square(row, col), ToPieceClass(targetFen));
             SaveConfig();
 
@@ -574,6 +608,7 @@ namespace ChGhost
 
         private void ResetBoardTracking()
         {
+            CancelHumanDelay();
             _gameStateTracker.Reset();
             _lastBestMove = "";
             _lastMoveRussianText = "";
@@ -582,6 +617,18 @@ namespace ChGhost
             _lastIllegalFen = "";
             _activeFen = null;
             _currentGrid = null;
+            _advisorMoves.Clear();
+        }
+
+        private void CancelHumanDelay()
+        {
+            try
+            {
+                _humanDelayCts?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
 
         private async Task StartNewGameAndScanAsync()
@@ -650,7 +697,9 @@ namespace ChGhost
             string speedText = _isBlitzTurboMode ? "БЛИЦ" : "РАПИД";
             string powerText = _settings.FullStrength ? $"MAX • {_settings.EffectiveEngineThreads}T" : _settings.TargetElo.ToString();
 
-            string recognizerText = CalibratableRecognizer == null ? "[AI]" : $"[П{_activeProfile}]";
+            string recognizerText = CalibratableRecognizer == null
+                ? (_settings.StealthHumanize ? "[AI·S]" : "[AI]")
+                : $"[П{_activeProfile}]";
             HeaderText.Text = $"CHESS GHOST {recognizerText} • {sideText} • {stateText} • {speedText} ({powerText})";
             HeaderText.Foreground = _isRunning
                 ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(0, 255, 136))
@@ -852,6 +901,7 @@ namespace ChGhost
             else
             {
                 _scanTimer.Stop();
+                CancelHumanDelay();
                 ClearGraphics();
             }
             UpdateUI();
@@ -936,10 +986,40 @@ namespace ChGhost
             BoardRect bounds = _boardDetector.Detect() ?? throw new InvalidOperationException("Board bounds are not configured.");
             int width = bounds.Width;
             int height = bounds.Height;
-            Bitmap bmp = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
-            using Graphics g = Graphics.FromImage(bmp);
+            if (_captureBitmap == null || _captureBitmap.Width != width || _captureBitmap.Height != height)
+            {
+                _captureBitmap?.Dispose();
+                _captureBitmap = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            }
+            using Graphics g = Graphics.FromImage(_captureBitmap);
             g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, new System.Drawing.Size(width, height));
+            return _captureBitmap;
+        }
+
+        private Bitmap CaptureBoardSnapshot()
+        {
+            BoardRect bounds = _boardDetector.Detect() ?? throw new InvalidOperationException("Board bounds are not configured.");
+            Bitmap bmp = new Bitmap(bounds.Width, bounds.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            using Graphics g = Graphics.FromImage(bmp);
+            g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, new System.Drawing.Size(bounds.Width, bounds.Height));
             return bmp;
+        }
+
+        private async Task MaybeUnloadIdleEngineAsync()
+        {
+            if (_settings.EngineIdleUnloadSeconds <= 0)
+                return;
+            try
+            {
+                await _engine.UnloadIfIdleAsync(TimeSpan.FromSeconds(_settings.EngineIdleUnloadSeconds));
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"Idle engine unload failed: {ex.Message}");
+            }
         }
 
         private async Task ScanAndSuggestAsync(bool forceCalculate = false)
@@ -958,7 +1038,7 @@ namespace ChGhost
             {
                 BoardRecognitionResult recognition = await Task.Run(() =>
                 {
-                    using Bitmap bmp = CaptureBoard();
+                    Bitmap bmp = CaptureBoard();
                     return _recognizer.Recognize(bmp, playAsBlackSnap);
                 });
 
@@ -974,16 +1054,19 @@ namespace ChGhost
                             _lastBoardVisible = false;
                         }
                         UpdateUI("Доска перекрыта / не видна — сканирование на паузе");
+                        await MaybeUnloadIdleEngineAsync();
                         return;
                     }
                     _lastBoardVisible = true;
                 }
 
                 _appLifetime.Token.ThrowIfCancellationRequested();
-                await _engine.EnsureRunningAsync(_appLifetime.Token);
                 TrackingUpdate tracking = _gameStateTracker.Update(recognition, forceCalculate, playAsBlackSnap);
                 if (tracking.IsDebounced)
+                {
+                    await MaybeUnloadIdleEngineAsync();
                     return;
+                }
 
                 if (!tracking.IsValid)
                 {
@@ -998,6 +1081,7 @@ namespace ChGhost
 
                 if (tracking.IsUnchanged)
                 {
+                    await MaybeUnloadIdleEngineAsync();
                     RedrawOverlay();
                     return;
                 }
@@ -1007,6 +1091,8 @@ namespace ChGhost
                     _lastBestMove = "";
                     _lastMoveRussianText = "";
                     _lastMoveIsCastling = false;
+                    _advisorMoves.Clear();
+                    await MaybeUnloadIdleEngineAsync();
                     RedrawOverlay();
                     UpdateUI("Жду хода соперника... (Alt+3: если соперник уже сходил)");
                     return;
@@ -1014,6 +1100,7 @@ namespace ChGhost
 
                 if (!tracking.ShouldCalculateMove)
                 {
+                    await MaybeUnloadIdleEngineAsync();
                     RedrawOverlay();
                     return;
                 }
@@ -1032,14 +1119,81 @@ namespace ChGhost
                         _lastIllegalFen = fullFen;
                     }
                     _debugInfo = $"Нелегальная позиция: {illegalReason}";
+                    await MaybeUnloadIdleEngineAsync();
                     UpdateUI(_debugInfo);
                     return;
                 }
 
+                _advisorMoves.Clear();
+                bool useHumanizer = _settings.StealthHumanize && _settings.MultiPvCount > 1;
+                int requestedMultiPv = Math.Clamp(_settings.MultiPvCount, 1, 6);
+                IReadOnlyList<CandidateMove> candidates = Array.Empty<CandidateMove>();
+                string bestMove = "(none)";
+                int appliedDelayMs = 0;
+                int pvCount = 1;
+                int pickIndex = 1;
                 var sfStopwatch = System.Diagnostics.Stopwatch.StartNew();
-                string bestMove = await _engine.GetBestMoveAsync(fullFen, moveTimeMs, _appLifetime.Token);
+                if (useHumanizer)
+                {
+                    candidates = await _engine.GetTopMovesAsync(fullFen, moveTimeMs, requestedMultiPv, _appLifetime.Token);
+                    pvCount = candidates.Count;
+                }
+                else
+                {
+                    bestMove = await _engine.GetBestMoveAsync(fullFen, moveTimeMs, _appLifetime.Token);
+                }
                 sfStopwatch.Stop();
-                _logger.Info($"[MOVE] black={playAsBlackSnap} | inferMs={inferMs:F1} | dirty={dirtyCount} | sfMs={sfStopwatch.Elapsed.TotalMilliseconds:F1} | fen={fullFen} | best={bestMove}");
+
+                if (useHumanizer)
+                {
+                    if (candidates.Count == 0)
+                    {
+                        bestMove = "(none)";
+                    }
+                    else
+                    {
+                        var humanizerOptions = new HumanizerOptions(
+                            MaxCpLoss: _settings.HumanMaxCpLoss,
+                            Temperature: _settings.HumanTemperature,
+                            AdvisorMaxGapCp: _settings.AdvisorMaxGapCp,
+                            PacingEnabled: _settings.HumanPacingEnabled,
+                            MinDelayMs: _isBlitzTurboMode ? _settings.HumanDelayBlitzMinMs : _settings.HumanDelayRapidMinMs,
+                            MaxDelayMs: _isBlitzTurboMode ? _settings.HumanDelayBlitzMaxMs : _settings.HumanDelayRapidMaxMs);
+                        MoveRecommendation rec = HumanMoveSelector.Select(candidates, stableGrid, humanizerOptions, _rng);
+                        bestMove = rec.Primary.Uci;
+                        pickIndex = rec.Primary.MultiPvIndex;
+                        if (_settings.ShowAdvisorArrows)
+                        {
+                            foreach (CandidateMove alt in rec.Alternatives.Take(2))
+                                _advisorMoves.Add(alt.Uci);
+                        }
+
+                        if (_settings.HumanPacingEnabled && rec.RecommendedDelayMs > 0 && !forceCalculate)
+                        {
+                            var delayCts = CancellationTokenSource.CreateLinkedTokenSource(_appLifetime.Token);
+                            _humanDelayCts = delayCts;
+                            try
+                            {
+                                await Task.Delay(rec.RecommendedDelayMs, delayCts.Token);
+                            }
+                            catch (OperationCanceledException) when (!_appLifetime.IsCancellationRequested)
+                            {
+                                return;
+                            }
+                            finally
+                            {
+                                if (ReferenceEquals(_humanDelayCts, delayCts))
+                                    _humanDelayCts = null;
+                                delayCts.Dispose();
+                            }
+                            if (_activeFen != fullFen || !_isRunning)
+                                return;
+                            appliedDelayMs = rec.RecommendedDelayMs;
+                        }
+                    }
+                }
+
+                _logger.Info($"[MOVE] black={playAsBlackSnap} | inferMs={inferMs:F1} | dirty={dirtyCount} | sfMs={sfStopwatch.Elapsed.TotalMilliseconds:F1} | delayMs={appliedDelayMs} | pv={pvCount} | pick=#{pickIndex} | fen={fullFen} | best={bestMove}");
 
                 if (bestMove.Length >= 4 && bestMove != "(none)")
                 {
@@ -1086,9 +1240,9 @@ namespace ChGhost
             catch (Exception ex)
             {
                 _logger.Error($"Board scan or Stockfish operation failed. fen={_activeFen ?? "-"}", ex);
-                _debugInfo = File.Exists(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "stockfish.exe"))
+                _debugInfo = File.Exists(_enginePath)
                     ? $"Ошибка движка: {ex.Message}"
-                    : "Не найден stockfish.exe рядом с ChGhost.exe.";
+                    : $"Не найден {_settings.EngineExecutablePath} рядом с ChGhost.exe.";
                 UpdateUI(_debugInfo);
             }
             finally
@@ -1118,6 +1272,23 @@ namespace ChGhost
                     DrawCastlingArrows(_lastBestMove);
                 else
                     DrawSingleArrow(_lastBestMove, System.Windows.Media.Color.FromArgb(215, 0, 255, 136), thickness: 8);
+
+                if (_settings.ShowAdvisorArrows)
+                {
+                    int advisorIndex = 0;
+                    foreach (string altMove in _advisorMoves)
+                    {
+                        if (advisorIndex >= 2)
+                            break;
+                        DrawSingleArrow(
+                            altMove,
+                            System.Windows.Media.Color.FromArgb(120, 150, 170, 190),
+                            thickness: 4,
+                            offsetY: 16 + advisorIndex * 16,
+                            opacity: 0.42);
+                        advisorIndex++;
+                    }
+                }
             }
         }
 
@@ -1183,7 +1354,7 @@ namespace ChGhost
             }
         }
 
-        private void DrawSingleArrow(string uciMove, System.Windows.Media.Color argbColor, double thickness, double offsetY = 0)
+        private void DrawSingleArrow(string uciMove, System.Windows.Media.Color argbColor, double thickness, double offsetY = 0, double opacity = 1.0)
         {
             int c1 = uciMove[0] - 'a';
             int r1 = 8 - (uciMove[1] - '0');
@@ -1215,7 +1386,8 @@ namespace ChGhost
                 Stroke = brush,
                 StrokeThickness = thickness,
                 StrokeStartLineCap = PenLineCap.Round,
-                StrokeEndLineCap = PenLineCap.Round
+                StrokeEndLineCap = PenLineCap.Round,
+                Opacity = opacity
             };
 
             double angle = Math.Atan2(y2 - y1, x2 - x1);
@@ -1228,7 +1400,8 @@ namespace ChGhost
                     new System.Windows.Point(x2, y2),
                     new System.Windows.Point(x2 - headLen * Math.Cos(angle - Math.PI / 6), y2 - headLen * Math.Sin(angle - Math.PI / 6)),
                     new System.Windows.Point(x2 - headLen * Math.Cos(angle + Math.PI / 6), y2 - headLen * Math.Sin(angle + Math.PI / 6))
-                }
+                },
+                Opacity = opacity
             };
 
             OverlayCanvas.Children.Add(line);
@@ -1247,6 +1420,9 @@ namespace ChGhost
                 _closing = true;
                 _appLifetime.Cancel();
                 _scanTimer.Stop();
+                CancelHumanDelay();
+                _captureBitmap?.Dispose();
+                _captureBitmap = null;
                 UnregisterHotKeys();
                 try
                 {
