@@ -42,6 +42,65 @@ public class OnnxBoardRecognizerTests
         Assert.Equal(true, detected);
     }
 
+    [Fact]
+    public void TryDetectPlayAsBlackStrict_MisorientedFlippedFen_ReturnsTrue()
+    {
+        char[,] grid = CreateGridFromRows(
+            "RNBKQBNR",
+            "PPP1PPPP",
+            "11111111",
+            "111P1111",
+            "11111111",
+            "11111111",
+            "pppppppp",
+            "rnbkqbnr");
+
+        bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(grid, currentPlayAsBlack: false);
+
+        Assert.Equal(true, detected);
+    }
+
+    [Fact]
+    public void TryDetectPlayAsBlackStrict_WhiteStartingPosition_ReturnsFalse()
+    {
+        char[,] grid = CreateStartingGrid();
+
+        bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(grid, currentPlayAsBlack: false);
+
+        Assert.Equal(false, detected);
+    }
+
+    [Fact]
+    public void TryDetectPlayAsBlackStrict_LateEndgame_ReturnsNull()
+    {
+        char[,] grid = CreateGridFromRows(
+            "R1111111",
+            "111K1111",
+            "11111111",
+            "11111111",
+            "11111111",
+            "11111111",
+            "1111k111",
+            "1111111r");
+
+        bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(grid, currentPlayAsBlack: false);
+
+        Assert.Null(detected);
+    }
+
+    private static char[,] CreateGridFromRows(params string[] rows)
+    {
+        Assert.Equal(8, rows.Length);
+        var grid = new char[8, 8];
+        for (int r = 0; r < 8; r++)
+        {
+            Assert.Equal(8, rows[r].Length);
+            for (int c = 0; c < 8; c++)
+                grid[r, c] = rows[r][c];
+        }
+        return grid;
+    }
+
     private static char[,] CreateStartingGrid()
     {
         const string blackBackRank = "rnbqkbnr";

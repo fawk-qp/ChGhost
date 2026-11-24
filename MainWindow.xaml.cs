@@ -416,7 +416,7 @@ namespace ChGhost
                     onnxRec.InvalidateCache();
                     using Bitmap boardBmp = CaptureBoardSnapshot();
                     BoardRecognitionResult recognition = onnxRec.Recognize(boardBmp, _playAsBlack);
-                    bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlack(recognition.RawGrid, _playAsBlack);
+                    bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(recognition.RawGrid, _playAsBlack);
                     if (detected.HasValue)
                         _playAsBlack = detected.Value;
                 }
@@ -519,7 +519,7 @@ namespace ChGhost
                 onnxRecognizer.InvalidateCache();
                 using Bitmap boardBmp = CaptureBoardSnapshot();
                 BoardRecognitionResult recognition = onnxRecognizer.Recognize(boardBmp, _playAsBlack);
-                bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlack(recognition.RawGrid, _playAsBlack);
+                bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(recognition.RawGrid, _playAsBlack);
                 if (!detected.HasValue)
                     return;
 
@@ -1058,6 +1058,18 @@ namespace ChGhost
                         return;
                     }
                     _lastBoardVisible = true;
+
+                    bool? strictSide = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(recognition.RawGrid, _playAsBlack);
+                    if (strictSide.HasValue && strictSide.Value != _playAsBlack)
+                    {
+                        _playAsBlack = strictSide.Value;
+                        recognition = onnxRecognizer.ReprojectCachedResult(_playAsBlack);
+                        playAsBlackSnap = _playAsBlack;
+                        ResetBoardTracking();
+                        SaveConfig();
+                        UpdateUI();
+                        _logger.Info($"[ORIENT] Auto-flipped playAsBlack={_playAsBlack} from live board.");
+                    }
                 }
 
                 _appLifetime.Token.ThrowIfCancellationRequested();
@@ -1268,13 +1280,11 @@ namespace ChGhost
             }
             if (!string.IsNullOrEmpty(_lastBestMove) && _lastBestMove.Length >= 4)
             {
-                if (_lastMoveIsCastling)
-                    DrawCastlingArrows(_lastBestMove);
-                else
-                    DrawSingleArrow(_lastBestMove, System.Windows.Media.Color.FromArgb(215, 0, 255, 136), thickness: 8);
-
                 if (_settings.ShowAdvisorArrows)
                 {
+                    double advisorOpacity = Math.Clamp(_settings.AdvisorArrowOpacity, 0.2, 1.0);
+                    System.Windows.Media.Color advisorColor1 = ParseAdvisorColor(_settings.AdvisorArrowColor1, System.Windows.Media.Color.FromRgb(0, 229, 255));
+                    System.Windows.Media.Color advisorColor2 = ParseAdvisorColor(_settings.AdvisorArrowColor2, System.Windows.Media.Color.FromRgb(224, 64, 251));
                     int advisorIndex = 0;
                     foreach (string altMove in _advisorMoves)
                     {
@@ -1282,13 +1292,19 @@ namespace ChGhost
                             break;
                         DrawSingleArrow(
                             altMove,
-                            System.Windows.Media.Color.FromArgb(120, 150, 170, 190),
-                            thickness: 4,
+                            advisorIndex == 0 ? advisorColor1 : advisorColor2,
+                            thickness: 6.4,
                             offsetY: 16 + advisorIndex * 16,
-                            opacity: 0.42);
+                            opacity: advisorOpacity,
+                            highContrastOutline: true);
                         advisorIndex++;
                     }
                 }
+
+                if (_lastMoveIsCastling)
+                    DrawCastlingArrows(_lastBestMove);
+                else
+                    DrawSingleArrow(_lastBestMove, System.Windows.Media.Color.FromArgb(215, 0, 255, 136), thickness: 8);
             }
         }
 
@@ -1354,7 +1370,21 @@ namespace ChGhost
             }
         }
 
-        private void DrawSingleArrow(string uciMove, System.Windows.Media.Color argbColor, double thickness, double offsetY = 0, double opacity = 1.0)
+        private static System.Windows.Media.Color ParseAdvisorColor(string? value, System.Windows.Media.Color fallback)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return fallback;
+            try
+            {
+                return (System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(value.Trim());
+            }
+            catch (Exception ex) when (ex is FormatException or InvalidOperationException or ArgumentException or InvalidCastException)
+            {
+                return fallback;
+            }
+        }
+
+        private void DrawSingleArrow(string uciMove, System.Windows.Media.Color argbColor, double thickness, double offsetY = 0, double opacity = 1.0, bool highContrastOutline = false)
         {
             int c1 = uciMove[0] - 'a';
             int r1 = 8 - (uciMove[1] - '0');
@@ -1379,6 +1409,22 @@ namespace ChGhost
             double y2 = startY + (r2 + 0.5) * cellH + offsetY;
 
             var brush = new SolidColorBrush(argbColor);
+            SolidColorBrush? outlineBrush = highContrastOutline
+                ? new SolidColorBrush(System.Windows.Media.Color.FromArgb(204, 0, 0, 0))
+                : null;
+
+            if (outlineBrush != null)
+            {
+                OverlayCanvas.Children.Add(new Line
+                {
+                    X1 = x1, Y1 = y1, X2 = x2, Y2 = y2,
+                    Stroke = outlineBrush,
+                    StrokeThickness = thickness + 3.0,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Round,
+                    Opacity = opacity
+                });
+            }
 
             var line = new Line
             {
@@ -1395,6 +1441,8 @@ namespace ChGhost
             var arrowHead = new Polygon
             {
                 Fill = brush,
+                Stroke = outlineBrush,
+                StrokeThickness = highContrastOutline ? 1.5 : 0,
                 Points = new PointCollection
                 {
                     new System.Windows.Point(x2, y2),

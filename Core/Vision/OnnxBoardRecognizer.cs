@@ -84,6 +84,18 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         }
     }
 
+    public BoardRecognitionResult ReprojectCachedResult(bool playAsBlack)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        lock (_inferLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_hasCache)
+                return CreateEmptyResult();
+            return BuildResultFromCache(playAsBlack);
+        }
+    }
+
     /// <summary>
     /// Автоматически определяет сторону (true = чёрные снизу), сравнивая
     /// распределение белых и чёрных фигур по верхней и нижней половинам доски.
@@ -130,6 +142,68 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         // Если средние ряды разнесены хотя бы на 1.5 горизонтали — ориентация надёжна
         if (blackAvgRow - whiteAvgRow >= 1.5) return true;   // Чёрные внизу (sr ближе к 7)
         if (whiteAvgRow - blackAvgRow >= 1.5) return false;  // Белые внизу (sr ближе к 7)
+        return null;
+    }
+
+    public static bool? TryDetectPlayAsBlackStrict(char[,] boardGrid, bool currentPlayAsBlack)
+    {
+        int wpTop = 0, wpBot = 0, bpTop = 0, bpBot = 0;
+        int whitePieces = 0, blackPieces = 0;
+        double whiteRowSum = 0, blackRowSum = 0;
+        double whiteWeightSum = 0, blackWeightSum = 0;
+
+        for (int sr = 0; sr < 8; sr++)
+        {
+            int br = currentPlayAsBlack ? 7 - sr : sr;
+            for (int bc = 0; bc < 8; bc++)
+            {
+                char p = boardGrid[br, bc];
+                if (p == '1') continue;
+
+                bool isWhite = char.IsUpper(p);
+                char upper = char.ToUpperInvariant(p);
+                double weight = upper == 'K' ? 3.0 : upper == 'P' ? 1.5 : 1.0;
+
+                if (isWhite)
+                {
+                    whitePieces++;
+                    whiteRowSum += sr * weight;
+                    whiteWeightSum += weight;
+                    if (p == 'P')
+                    {
+                        if (sr <= 2) wpTop++;
+                        else if (sr >= 5) wpBot++;
+                    }
+                }
+                else
+                {
+                    blackPieces++;
+                    blackRowSum += sr * weight;
+                    blackWeightSum += weight;
+                    if (p == 'p')
+                    {
+                        if (sr <= 2) bpTop++;
+                        else if (sr >= 5) bpBot++;
+                    }
+                }
+            }
+        }
+
+        if (wpTop >= 4 && bpBot >= 4 && wpBot <= 1 && bpTop <= 1)
+            return true;
+        if (wpBot >= 4 && bpTop >= 4 && wpTop <= 1 && bpBot <= 1)
+            return false;
+
+        int totalPieces = whitePieces + blackPieces;
+        if (totalPieces >= 20 && whitePieces >= 8 && blackPieces >= 8
+            && whiteWeightSum > 0 && blackWeightSum > 0)
+        {
+            double whiteAvgRow = whiteRowSum / whiteWeightSum;
+            double blackAvgRow = blackRowSum / blackWeightSum;
+            if (blackAvgRow - whiteAvgRow >= 2.2) return true;
+            if (whiteAvgRow - blackAvgRow >= 2.2) return false;
+        }
+
         return null;
     }
 

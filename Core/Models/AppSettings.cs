@@ -24,6 +24,9 @@ public sealed class AppSettings
     public double HumanTemperature { get; set; } = 32.0;
     public bool ShowAdvisorArrows { get; set; } = true;
     public int AdvisorMaxGapCp { get; set; } = 65;
+    public string AdvisorArrowColor1 { get; set; } = "#00E5FF";
+    public string AdvisorArrowColor2 { get; set; } = "#E040FB";
+    public double AdvisorArrowOpacity { get; set; } = 0.82;
     public bool HumanPacingEnabled { get; set; } = true;
     public int HumanDelayBlitzMinMs { get; set; } = 120;
     public int HumanDelayBlitzMaxMs { get; set; } = 950;
@@ -57,6 +60,9 @@ public sealed class AppSettings
         , HumanTemperature = 32.0
         , ShowAdvisorArrows = true
         , AdvisorMaxGapCp = 65
+        , AdvisorArrowColor1 = "#00E5FF"
+        , AdvisorArrowColor2 = "#E040FB"
+        , AdvisorArrowOpacity = 0.82
         , HumanPacingEnabled = true
         , HumanDelayBlitzMinMs = 120
         , HumanDelayBlitzMaxMs = 950
@@ -91,6 +97,9 @@ public sealed class AppSettings
         HumanMaxCpLoss = Math.Clamp(HumanMaxCpLoss, 0, 2_000);
         HumanTemperature = Math.Clamp(HumanTemperature, 8.0, 256.0);
         AdvisorMaxGapCp = Math.Clamp(AdvisorMaxGapCp, 0, 2_000);
+        AdvisorArrowOpacity = Math.Clamp(AdvisorArrowOpacity, 0.2, 1.0);
+        AdvisorArrowColor1 = string.IsNullOrWhiteSpace(AdvisorArrowColor1) ? "#00E5FF" : AdvisorArrowColor1.Trim();
+        AdvisorArrowColor2 = string.IsNullOrWhiteSpace(AdvisorArrowColor2) ? "#E040FB" : AdvisorArrowColor2.Trim();
         HumanDelayBlitzMinMs = Math.Clamp(HumanDelayBlitzMinMs, 0, 60_000);
         HumanDelayBlitzMaxMs = Math.Clamp(HumanDelayBlitzMaxMs, HumanDelayBlitzMinMs, 60_000);
         HumanDelayRapidMinMs = Math.Clamp(HumanDelayRapidMinMs, 0, 60_000);
