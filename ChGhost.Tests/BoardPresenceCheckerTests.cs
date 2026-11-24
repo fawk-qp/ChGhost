@@ -40,6 +40,28 @@ public class BoardPresenceCheckerTests
     }
 
     [Fact]
+    public void Checkerboard48_IsPresent()
+    {
+        byte[] buffer = CreateBoard(highlighted: false, width: 384, height: 384, tileSize: 48);
+
+        Assert.True(BoardPresenceChecker.IsCheckerboardPresent(buffer, 384 * 3, 48));
+    }
+
+    [Fact]
+    public void DarkBackground48_IsNotPresent()
+    {
+        var buffer = new byte[384 * 384 * 3];
+        for (int i = 0; i < buffer.Length; i += 3)
+        {
+            buffer[i] = 20;
+            buffer[i + 1] = 20;
+            buffer[i + 2] = 20;
+        }
+
+        Assert.False(BoardPresenceChecker.IsCheckerboardPresent(buffer, 384 * 3, 48));
+    }
+
+    [Fact]
     public void HorizontalWindowStripes_AreNotPresent()
     {
         var buffer = new byte[Stride * Height];
@@ -59,16 +81,17 @@ public class BoardPresenceCheckerTests
         Assert.False(BoardPresenceChecker.IsCheckerboardPresent(buffer, Stride));
     }
 
-    private static byte[] CreateBoard(bool highlighted)
+    private static byte[] CreateBoard(bool highlighted, int width = Width, int height = Height, int tileSize = TileSize)
     {
-        var buffer = new byte[Stride * Height];
-        for (int y = 0; y < Height; y++)
+        int stride = width * 3;
+        var buffer = new byte[stride * height];
+        for (int y = 0; y < height; y++)
         {
-            int sr = y / TileSize;
-            int row = y * Stride;
-            for (int x = 0; x < Width; x++)
+            int sr = y / tileSize;
+            int row = y * stride;
+            for (int x = 0; x < width; x++)
             {
-                int sc = x / TileSize;
+                int sc = x / tileSize;
                 bool even = ((sr + sc) & 1) == 0;
                 bool highlight = highlighted && sr == sc && sr < 4;
                 byte value = (byte)(highlight || !even ? 35 : 210);

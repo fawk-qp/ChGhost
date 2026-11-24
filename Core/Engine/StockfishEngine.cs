@@ -18,6 +18,8 @@ public sealed class StockfishEngine : IChessEngine
     private Channel<string>? _output;
     private Task? _outputReader;
     private bool _disposed;
+    private int _currentMultiPv = 1;
+    private DateTime _lastUsedUtc = DateTime.UtcNow;
 
     public StockfishEngine(string executablePath, AppSettings settings, IAppLogger logger)
     {
@@ -53,6 +55,7 @@ public sealed class StockfishEngine : IChessEngine
         try
         {
             ThrowIfDisposed();
+            _lastUsedUtc = DateTime.UtcNow;
             await EnsureRunningCoreAsync(cancellationToken).ConfigureAwait(false);
             await WriteCommandAsync("ucinewgame", cancellationToken).ConfigureAwait(false);
             await WriteCommandAsync("isready", cancellationToken).ConfigureAwait(false);
@@ -77,23 +80,7 @@ public sealed class StockfishEngine : IChessEngine
         try
         {
             ThrowIfDisposed();
-            await EnsureRunningCoreAsync(cancellationToken).ConfigureAwait(false);
-            await WriteCommandAsync("isready", cancellationToken).ConfigureAwait(false);
-            await WaitForLineAsync(line => line == "readyok", cancellationToken).ConfigureAwait(false);
-            DrainOutput();
-
-            await WriteCommandAsync($"position fen {fen}", cancellationToken).ConfigureAwait(false);
-            await WriteCommandAsync($"go movetime {Math.Clamp(moveTimeMs, 1, 60_000)}", cancellationToken).ConfigureAwait(false);
-            string response = await WaitForLineAsync(line => line.StartsWith("bestmove ", StringComparison.Ordinal), cancellationToken)
-                .ConfigureAwait(false);
-            string[] parts = response.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 2)
-                throw new InvalidDataException($"Invalid Stockfish response: '{response}'.");
-            string bestMove = parts[1];
-            if (bestMove == "(none)")
-                return bestMove;
-            if (!IsValidUciMove(bestMove))
-                throw new InvalidDataException($"Invalid Stockfish bestmove: '{response}'.");
+            (string bestMove, _) = await SearchAsync(fen, moveTimeMs, multiPv: 1, cancellationToken).ConfigureAwait(false);
             return bestMove;
         }
         catch (Exception ex) when (IsEngineFailure(ex))
@@ -108,12 +95,65 @@ public sealed class StockfishEngine : IChessEngine
         }
     }
 
+    public async Task<IReadOnlyList<CandidateMove>> GetTopMovesAsync(
+        string fen,
+        int moveTimeMs,
+        int multiPv,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(fen);
+        await _commandLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            (_, IReadOnlyList<CandidateMove> candidates) = await SearchAsync(
+                fen,
+                moveTimeMs,
+                Math.Clamp(multiPv, 1, 6),
+                cancellationToken).ConfigureAwait(false);
+            return candidates;
+        }
+        catch (Exception ex) when (IsEngineFailure(ex))
+        {
+            _logger.Error("Stockfish failed while calculating top moves.", ex);
+            await StopProcessAsync(graceful: true).ConfigureAwait(false);
+            throw;
+        }
+        finally
+        {
+            _commandLock.Release();
+        }
+    }
+
+    public async Task UnloadIfIdleAsync(TimeSpan maxIdle)
+    {
+        if (maxIdle <= TimeSpan.Zero)
+            return;
+
+        await _commandLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            Process? process = _process;
+            if (process == null || process.HasExited || DateTime.UtcNow - _lastUsedUtc < maxIdle)
+                return;
+
+            await StopProcessAsync(graceful: true).ConfigureAwait(false);
+            _logger.Info("Stockfish unloaded due to idle timeout.");
+        }
+        finally
+        {
+            _commandLock.Release();
+        }
+    }
+
     public async Task RestartAsync(CancellationToken cancellationToken)
     {
         await _commandLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ThrowIfDisposed();
+            _lastUsedUtc = DateTime.UtcNow;
             await StopProcessAsync(graceful: true).ConfigureAwait(false);
             await StartProcessAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -183,6 +223,7 @@ public sealed class StockfishEngine : IChessEngine
             await WriteCommandAsync($"setoption name Threads value {_settings.EffectiveEngineThreads}", cancellationToken).ConfigureAwait(false);
             await WriteCommandAsync($"setoption name Hash value {_settings.EngineHashMb}", cancellationToken).ConfigureAwait(false);
             await WriteCommandAsync("setoption name MultiPV value 1", cancellationToken).ConfigureAwait(false);
+            _currentMultiPv = 1;
             await WriteCommandAsync("setoption name Move Overhead value 15", cancellationToken).ConfigureAwait(false);
             if (_settings.FullStrength)
             {
@@ -198,6 +239,7 @@ public sealed class StockfishEngine : IChessEngine
             await WriteCommandAsync("ucinewgame", cancellationToken).ConfigureAwait(false);
             await WriteCommandAsync("isready", cancellationToken).ConfigureAwait(false);
             await WaitForLineAsync(line => line == "readyok", cancellationToken).ConfigureAwait(false);
+            _lastUsedUtc = DateTime.UtcNow;
             _logger.Info($"Stockfish started with {_settings.EffectiveEngineThreads} thread(s), {_settings.EngineHashMb} MB hash.");
         }
         catch
@@ -223,6 +265,65 @@ public sealed class StockfishEngine : IChessEngine
             }
             throw;
         }
+    }
+
+    private async Task<(string BestMove, IReadOnlyList<CandidateMove> Candidates)> SearchAsync(
+        string fen,
+        int moveTimeMs,
+        int multiPv,
+        CancellationToken cancellationToken)
+    {
+        _lastUsedUtc = DateTime.UtcNow;
+        await EnsureRunningCoreAsync(cancellationToken).ConfigureAwait(false);
+        await WriteCommandAsync("isready", cancellationToken).ConfigureAwait(false);
+        await WaitForLineAsync(line => line == "readyok", cancellationToken).ConfigureAwait(false);
+        DrainOutput();
+
+        int targetMultiPv = Math.Clamp(multiPv, 1, 6);
+        if (targetMultiPv != _currentMultiPv)
+        {
+            await WriteCommandAsync($"setoption name MultiPV value {targetMultiPv}", cancellationToken).ConfigureAwait(false);
+            _currentMultiPv = targetMultiPv;
+        }
+
+        await WriteCommandAsync($"position fen {fen}", cancellationToken).ConfigureAwait(false);
+        await WriteCommandAsync($"go movetime {Math.Clamp(moveTimeMs, 1, 60_000)}", cancellationToken).ConfigureAwait(false);
+
+        var pvCandidates = new Dictionary<int, CandidateMove>();
+        string response = await WaitForLineAsync(
+                line => line.StartsWith("bestmove ", StringComparison.Ordinal),
+                cancellationToken,
+                line =>
+                {
+                    if (!TryParseInfoPvLine(line, out CandidateMove candidate))
+                        return;
+                    if (!pvCandidates.TryGetValue(candidate.MultiPvIndex, out CandidateMove? existing)
+                        || candidate.Depth >= existing.Depth)
+                    {
+                        pvCandidates[candidate.MultiPvIndex] = candidate;
+                    }
+                })
+            .ConfigureAwait(false);
+
+        string[] parts = response.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+            throw new InvalidDataException($"Invalid Stockfish response: '{response}'.");
+        string bestMove = parts[1];
+        if (bestMove == "(none)")
+            return (bestMove, Array.Empty<CandidateMove>());
+        if (!IsValidUciMove(bestMove))
+            throw new InvalidDataException($"Invalid Stockfish bestmove: '{response}'.");
+
+        List<CandidateMove> candidates = pvCandidates.Values
+            .OrderByDescending(candidate => candidate.EffectiveCp)
+            .ThenBy(candidate => candidate.MultiPvIndex)
+            .ToList();
+        if (candidates.Count == 0
+            || candidates.All(candidate => !candidate.Uci.Equals(bestMove, StringComparison.OrdinalIgnoreCase)))
+        {
+            candidates = new List<CandidateMove> { new(bestMove, 0, false, 0, 1, 1) };
+        }
+        return (bestMove, candidates);
     }
 
     private async Task ReadOutputAsync(Process process, ChannelWriter<string> writer)
@@ -286,7 +387,59 @@ public sealed class StockfishEngine : IChessEngine
         return true;
     }
 
-    private async Task<string> WaitForLineAsync(Func<string, bool> predicate, CancellationToken cancellationToken)
+    public static bool TryParseInfoPvLine(string line, out CandidateMove candidate)
+    {
+        candidate = null!;
+        if (string.IsNullOrWhiteSpace(line)
+            || !line.StartsWith("info ", StringComparison.Ordinal)
+            || line.Contains(" lowerbound ", StringComparison.Ordinal)
+            || line.Contains(" upperbound ", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        string[] tokens = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        int depth = -1;
+        int multiPv = 1;
+        int scoreCp = 0;
+        int mateIn = 0;
+        bool isMate = false;
+
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            if (tokens[i] == "depth" && i + 1 < tokens.Length && int.TryParse(tokens[i + 1], out int parsedDepth))
+                depth = parsedDepth;
+            else if (tokens[i] == "multipv" && i + 1 < tokens.Length && int.TryParse(tokens[i + 1], out int parsedMultiPv))
+                multiPv = Math.Max(1, parsedMultiPv);
+            else if (tokens[i] == "score" && i + 2 < tokens.Length)
+            {
+                if (tokens[i + 1] == "cp" && int.TryParse(tokens[i + 2], out int parsedCp))
+                    scoreCp = parsedCp;
+                else if (tokens[i + 1] == "mate" && int.TryParse(tokens[i + 2], out int parsedMate))
+                {
+                    isMate = true;
+                    mateIn = parsedMate;
+                    scoreCp = 0;
+                }
+            }
+        }
+
+        int pvIndex = Array.IndexOf(tokens, "pv");
+        if (depth < 0 || pvIndex < 0 || pvIndex + 1 >= tokens.Length)
+            return false;
+
+        string uci = tokens[pvIndex + 1];
+        if (!IsValidUciMove(uci))
+            return false;
+
+        candidate = new CandidateMove(uci, scoreCp, isMate, mateIn, depth, multiPv);
+        return true;
+    }
+
+    private async Task<string> WaitForLineAsync(
+        Func<string, bool> predicate,
+        CancellationToken cancellationToken,
+        Action<string>? observe = null)
     {
         ChannelReader<string> reader = _output?.Reader ?? throw new InvalidOperationException("Stockfish output is unavailable.");
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -299,6 +452,7 @@ public sealed class StockfishEngine : IChessEngine
                     .AsTask()
                     .WaitAsync(TimeSpan.FromMilliseconds(_settings.CommandTimeoutMs), cancellationToken)
                     .ConfigureAwait(false);
+                observe?.Invoke(line);
                 if (predicate(line))
                     return line;
             }

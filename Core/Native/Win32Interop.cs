@@ -7,9 +7,12 @@ namespace ChGhost.Core.Native;
 public static class Win32Interop
 {
     public const uint WdaExcludeFromCapture = 0x00000011;
+    public const uint WdaNone = 0x00000000;
     public const int GwlExStyle = -20;
     public const int WsExTransparent = 0x00000020;
     public const int WsExLayered = 0x00080000;
+    public const int WsExNoActivate = 0x08000000;
+    public const int WsExToolWindow = 0x00000080;
     public const int WmHotkey = 0x0312;
     public const uint ModAlt = 0x0001;
     public const uint ModNoRepeat = 0x4000;
@@ -25,6 +28,18 @@ public static class Win32Interop
         bool succeeded = NativeMethods.SetWindowDisplayAffinity(window, affinity);
         errorCode = succeeded ? 0 : Marshal.GetLastWin32Error();
         return succeeded;
+    }
+
+    public static bool TrySetExcludeFromCapture(IntPtr hwnd, bool exclude)
+    {
+        Marshal.SetLastPInvokeError(0);
+        return NativeMethods.SetWindowDisplayAffinity(hwnd, exclude ? WdaExcludeFromCapture : WdaNone);
+    }
+
+    public static void ApplyNoActivateToolStyle(IntPtr hwnd)
+    {
+        int exStyle = GetWindowLong(hwnd, GwlExStyle);
+        TrySetWindowLong(hwnd, GwlExStyle, exStyle | WsExNoActivate | WsExToolWindow, out _);
     }
 
     public static bool TrySetWindowLong(IntPtr window, int index, int value, out int errorCode)

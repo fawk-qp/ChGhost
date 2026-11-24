@@ -368,21 +368,23 @@ def generate_split(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Synthetic chess square dataset generator for ChGhost v2.0-cv")
     parser.add_argument("--assets-dir", type=Path, default=Path("assets"))
-    parser.add_argument("--out-dir", type=Path, default=Path("data/synth"))
+    parser.add_argument("--out-dir", type=Path, default=None, help="Output dir (default: data/synth for 64px, data/synth_<tile> otherwise)")
+    parser.add_argument("--tile-size", type=int, default=64, help="Square tile size in pixels")
     parser.add_argument("--train-per-piece", type=int, default=4200, help="Samples per piece class (~63k total)")
     parser.add_argument("--val-per-piece", type=int, default=450, help="Validation samples per piece class")
     parser.add_argument("--empty-mult", type=float, default=3.0, help="Empty class multiplier vs single piece class")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = args.out_dir or (Path("data/synth") if args.tile_size == 64 else Path(f"data/synth_{args.tile_size}"))
+    out_dir.mkdir(parents=True, exist_ok=True)
     piece_sets_dict = load_piece_sets(args.assets_dir)
     piece_sets = list(piece_sets_dict.values())
     fonts = load_fonts()
 
-    generate_split(args.out_dir, "train", args.train_per_piece, args.empty_mult, piece_sets, fonts, args.seed)
-    generate_split(args.out_dir, "val", args.val_per_piece, args.empty_mult, piece_sets, fonts, args.seed + 1000)
-    print(f"Done! Check visual sanity in {args.out_dir / 'preview_samples.png'}")
+    generate_split(out_dir, "train", args.train_per_piece, args.empty_mult, piece_sets, fonts, args.seed, out_size=args.tile_size)
+    generate_split(out_dir, "val", args.val_per_piece, args.empty_mult, piece_sets, fonts, args.seed + 1000, out_size=args.tile_size)
+    print(f"Done! Check visual sanity in {out_dir / 'preview_samples.png'}")
 
 
 if __name__ == "__main__":
