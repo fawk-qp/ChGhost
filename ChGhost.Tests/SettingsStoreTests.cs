@@ -23,7 +23,7 @@ public class SettingsStoreTests
         Assert.Equal(120, settings.ScanIntervalBlitzMs);
         Assert.Equal(2600, settings.TargetElo);
         Assert.Equal("Auto", settings.RecognizerMode);
-        Assert.Equal("models/pieces_64x64.onnx", settings.OnnxModelPath);
+        Assert.Equal("models/pieces_48x48_tiny.onnx", settings.OnnxModelPath);
     }
 
     [Fact]
@@ -137,7 +137,7 @@ public class SettingsStoreTests
 
         settings.Normalize();
 
-        Assert.Equal("models/pieces_64x64.onnx", settings.OnnxModelPath);
+        Assert.Equal("models/pieces_48x48_tiny.onnx", settings.OnnxModelPath);
     }
 
     [Theory]

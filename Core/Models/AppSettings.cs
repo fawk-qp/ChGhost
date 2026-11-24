@@ -14,7 +14,7 @@ public sealed class AppSettings
     public int ScanIntervalRapidMs { get; set; } = 450;
     public int CommandTimeoutMs { get; set; } = 3500;
     public string RecognizerMode { get; set; } = "Auto";
-    public string OnnxModelPath { get; set; } = "models/pieces_64x64.onnx";
+    public string OnnxModelPath { get; set; } = "models/pieces_48x48_tiny.onnx";
     public string EngineExecutablePath { get; set; } = "stockfish.exe";
     public int EngineIdleUnloadSeconds { get; set; } = 90;
     public bool ExcludeFromCapture { get; set; } = true;
@@ -50,7 +50,7 @@ public sealed class AppSettings
         ScanIntervalRapidMs = 450,
         CommandTimeoutMs = 3500
         , RecognizerMode = "Auto"
-        , OnnxModelPath = "models/pieces_64x64.onnx"
+        , OnnxModelPath = "models/pieces_48x48_tiny.onnx"
         , EngineExecutablePath = "stockfish.exe"
         , EngineIdleUnloadSeconds = 90
         , ExcludeFromCapture = true
@@ -87,7 +87,7 @@ public sealed class AppSettings
             _ => "Auto"
         };
         OnnxModelPath = string.IsNullOrWhiteSpace(OnnxModelPath)
-            ? "models/pieces_64x64.onnx"
+            ? "models/pieces_48x48_tiny.onnx"
             : OnnxModelPath.Trim();
         EngineExecutablePath = string.IsNullOrWhiteSpace(EngineExecutablePath)
             ? "stockfish.exe"

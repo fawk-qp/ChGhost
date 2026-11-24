@@ -116,6 +116,15 @@ namespace ChGhost
                 string modelPath = _settings.OnnxModelPath;
                 if (!System.IO.Path.IsPathRooted(modelPath))
                     modelPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, modelPath);
+                if (!File.Exists(modelPath))
+                {
+                    string fallbackPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", "pieces_64x64.onnx");
+                    if (File.Exists(fallbackPath) && !string.Equals(modelPath, fallbackPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.Warn($"ONNX model not found: {modelPath}. Falling back to {fallbackPath}.");
+                        modelPath = fallbackPath;
+                    }
+                }
                 return new OnnxBoardRecognizer(modelPath, _logger);
             }
             catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or InvalidOperationException or OnnxRuntimeException)
