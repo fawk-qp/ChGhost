@@ -18,4 +18,6 @@ ml_pipeline/data/
 ml_pipeline/assets/
 ml_pipeline/__pycache__/
 ml_pipeline/.venv/
+logs/
 models/*.onnx
+!models/pieces_48x48_tiny.onnx
