@@ -80,6 +80,56 @@ class ChessPieceNet(nn.Module):
         return self.head(x)
 
 
+class DSBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+        self.dw = nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=stride, padding=1, groups=in_ch, bias=False)
+        self.bn_dw = nn.BatchNorm2d(in_ch)
+        self.pw = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.bn_pw = nn.BatchNorm2d(out_ch)
+        self.use_residual = stride == 1 and in_ch == out_ch
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = F.relu(self.bn_dw(self.dw(x)), inplace=True)
+        out = self.bn_pw(self.pw(out))
+        if self.use_residual:
+            out = F.relu(out + x, inplace=True)
+        else:
+            out = F.relu(out, inplace=True)
+        return out
+
+
+class TinyChessPieceNet(nn.Module):
+    def __init__(self, num_classes: int = 13):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.blocks = nn.Sequential(
+            DSBlock(32, 48, 1),
+            DSBlock(48, 48, 1),
+            DSBlock(48, 96, 2),
+            DSBlock(96, 96, 1),
+            DSBlock(96, 128, 2),
+            DSBlock(128, 128, 1),
+            DSBlock(128, 192, 2),
+            DSBlock(192, 192, 1),
+        )
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Dropout(p=0.15),
+            nn.Linear(192, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.blocks(x)
+        return self.head(x)
+
+
 class NumpySquareDataset(Dataset):
     def __init__(self, images: np.ndarray, labels: np.ndarray, augment: bool = False):
         self.images = images
@@ -104,7 +154,7 @@ class NumpySquareDataset(Dataset):
         return img, int(self.labels[idx])
 
 
-def load_real_holdout(holdout_dir: Path) -> NumpySquareDataset | None:
+def load_real_holdout(holdout_dir: Path, tile_size: int = 64) -> NumpySquareDataset | None:
     if not holdout_dir.exists():
         return None
 
@@ -120,7 +170,7 @@ def load_real_holdout(holdout_dir: Path) -> NumpySquareDataset | None:
         if not (0 <= cls_idx < 13):
             continue
         for file in sorted(sub.glob("*.png")) + sorted(sub.glob("*.jpg")):
-            im = Image.open(file).convert("RGB").resize((64, 64), Image.Resampling.BILINEAR)
+            im = Image.open(file).convert("RGB").resize((tile_size, tile_size), Image.Resampling.BILINEAR)
             imgs.append(np.asarray(im, dtype=np.uint8))
             lbls.append(cls_idx)
 
@@ -177,82 +227,95 @@ def print_confusion_analytics(title: str, conf: np.ndarray) -> None:
         print("Zero misclassifications on this split.")
 
 
-def export_and_verify_onnx(model: nn.Module, onnx_path: Path) -> None:
+def _measure_ort_latency(sess: ort.InferenceSession, x: np.ndarray, runs: int = 30) -> float:
+    for _ in range(5):
+        sess.run(["logits"], {"input": x})
+    t0 = time.perf_counter()
+    for _ in range(runs):
+        sess.run(["logits"], {"input": x})
+    return (time.perf_counter() - t0) * 1000.0 / runs
+
+
+def export_and_verify_onnx(model: nn.Module, onnx_path: Path, tile_size: int = 64) -> None:
     model_cpu = model.to("cpu").eval()
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
-    dummy = torch.randn(64, 3, 64, 64, dtype=torch.float32)
+    export_dummy = torch.randn(1, 3, tile_size, tile_size, dtype=torch.float32)
 
     torch.onnx.export(
         model_cpu,
-        dummy,
+        export_dummy,
         str(onnx_path),
         export_params=True,
         opset_version=17,
         do_constant_folding=True,
         input_names=["input"],
         output_names=["logits"],
-        dynamic_axes={"input": {0: "batch_size"}, "logits": {0: "batch_size"}},
+        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
     )
 
     onnx.checker.check_model(str(onnx_path))
 
-    with torch.no_grad():
-        torch_out = model_cpu(dummy).numpy()
-
     sess_opts = ort.SessionOptions()
     sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     sess = ort.InferenceSession(str(onnx_path), sess_options=sess_opts, providers=["CPUExecutionProvider"])
-    ort_out = sess.run(["logits"], {"input": dummy.numpy()})[0]
-    max_diff = float(np.max(np.abs(torch_out - ort_out)))
 
-    for _ in range(5):
-        sess.run(["logits"], {"input": dummy.numpy()})
-    t0 = time.perf_counter()
-    runs = 30
-    for _ in range(runs):
-        sess.run(["logits"], {"input": dummy.numpy()})
-    avg_ms = (time.perf_counter() - t0) * 1000.0 / runs
+    max_diff = 0.0
+    for batch in (64, 2):
+        verify = torch.randn(batch, 3, tile_size, tile_size, dtype=torch.float32)
+        with torch.no_grad():
+            torch_out = model_cpu(verify).numpy()
+        ort_out = sess.run(["logits"], {"input": verify.numpy()})[0]
+        max_diff = max(max_diff, float(np.max(np.abs(torch_out - ort_out))))
+
+    latency_64 = _measure_ort_latency(sess, torch.randn(64, 3, tile_size, tile_size).numpy())
+    latency_2 = _measure_ort_latency(sess, torch.randn(2, 3, tile_size, tile_size).numpy(), runs=50)
 
     size_mb = onnx_path.stat().st_size / (1024 * 1024)
     print(f"\nONNX exported: {onnx_path} ({size_mb:.2f} MB)")
     print(f"PyTorch vs ORT max abs logit diff: {max_diff:.6f}")
-    print(f"CPU batch-64 full-board latency:   {avg_ms:.2f} ms")
+    print(f"CPU batch-64 latency:                {latency_64:.2f} ms")
+    print(f"CPU batch-2 latency:                 {latency_2:.2f} ms")
     if max_diff > 1e-3:
         raise RuntimeError(f"ONNX numerical parity failed: max_diff={max_diff}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train ChessPieceNet and export ONNX for ChGhost")
-    parser.add_argument("--data-dir", type=Path, default=Path("data/synth"))
+    parser = argparse.ArgumentParser(description="Train ChessPieceNet/TinyChessPieceNet and export ONNX for ChGhost")
+    parser.add_argument("--data-dir", type=Path, default=None, help="Dataset dir (default: data/synth for 64px, data/synth_<tile> otherwise)")
     parser.add_argument("--holdout-dir", type=Path, default=Path("data/real_holdout/crops"))
-    parser.add_argument("--out-onnx", type=Path, default=Path("../models/pieces_64x64.onnx"))
+    parser.add_argument("--out-onnx", type=Path, default=None, help="Output ONNX path (default: ../models/pieces_<tile>x<tile>.onnx)")
+    parser.add_argument("--arch", choices=["base", "tiny"], default="base")
+    parser.add_argument("--tile-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=22)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1.5e-3)
     args = parser.parse_args()
 
+    data_dir = args.data_dir or (Path("data/synth") if args.tile_size == 64 else Path(f"data/synth_{args.tile_size}"))
+    out_onnx = args.out_onnx or Path(f"../models/pieces_{args.tile_size}x{args.tile_size}.onnx")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
     train_ds = NumpySquareDataset(
-        np.load(args.data_dir / "train_images.npy"),
-        np.load(args.data_dir / "train_labels.npy"),
+        np.load(data_dir / "train_images.npy"),
+        np.load(data_dir / "train_labels.npy"),
         augment=True,
     )
     val_ds = NumpySquareDataset(
-        np.load(args.data_dir / "val_images.npy"),
-        np.load(args.data_dir / "val_labels.npy"),
+        np.load(data_dir / "val_images.npy"),
+        np.load(data_dir / "val_labels.npy"),
         augment=False,
     )
-    holdout_ds = load_real_holdout(args.holdout_dir)
+    holdout_ds = load_real_holdout(args.holdout_dir, tile_size=args.tile_size)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=(device.type == "cuda"))
     val_loader = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=0, pin_memory=(device.type == "cuda"))
     holdout_loader = DataLoader(holdout_ds, batch_size=128, shuffle=False, num_workers=0) if holdout_ds else None
 
-    model = ChessPieceNet(num_classes=13).to(device)
+    model = (TinyChessPieceNet if args.arch == "tiny" else ChessPieceNet)(num_classes=13).to(device)
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"ChessPieceNet parameters: {param_count:,}")
+    print(f"{type(model).__name__} parameters: {param_count:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=2e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
@@ -318,7 +381,7 @@ def main() -> None:
     if best_holdout_conf is not None:
         print_confusion_analytics("Best REAL Holdout", best_holdout_conf)
 
-    export_and_verify_onnx(model, args.out_onnx)
+    export_and_verify_onnx(model, out_onnx, tile_size=args.tile_size)
 
 
 if __name__ == "__main__":

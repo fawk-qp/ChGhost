@@ -2,14 +2,17 @@ namespace ChGhost.Core.Vision;
 
 public static class BoardPresenceChecker
 {
-    private const int TileSize = 64;
-    private const int Margin = 4;
     private const double MinParityRgbDistance = 16.0;
     private const int MinMatchingSquares = 46;
 
-    public static bool IsCheckerboardPresent(ReadOnlySpan<byte> bgr24Buffer, int stride)
+    public static bool IsCheckerboardPresent(ReadOnlySpan<byte> bgr24Buffer, int stride, int tileSize = 64)
     {
-        if (stride < TileSize * 8 * 3 || bgr24Buffer.Length < stride * TileSize * 8)
+        if (tileSize <= 0)
+            return false;
+
+        int boardSize = tileSize * 8;
+        int margin = Math.Max(2, (int)Math.Round(tileSize * 0.065));
+        if (stride < boardSize * 3 || bgr24Buffer.Length < stride * boardSize)
             return false;
 
         Span<int> tileR = stackalloc int[64];
@@ -28,13 +31,13 @@ public static class BoardPresenceChecker
 
         for (int sr = 0; sr < 8; sr++)
         {
-            int yTop = sr * TileSize + Margin;
-            int yBot = (sr + 1) * TileSize - 1 - Margin;
+            int yTop = sr * tileSize + margin;
+            int yBot = (sr + 1) * tileSize - 1 - margin;
 
             for (int sc = 0; sc < 8; sc++)
             {
-                int xLeft = sc * TileSize + Margin;
-                int xRight = (sc + 1) * TileSize - 1 - Margin;
+                int xLeft = sc * tileSize + margin;
+                int xRight = (sc + 1) * tileSize - 1 - margin;
 
                 int p0 = yTop * stride + xLeft * 3;
                 int p1 = yTop * stride + xRight * 3;

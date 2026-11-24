@@ -14,11 +14,7 @@ namespace ChGhost.Core.Vision;
 
 public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
 {
-    private const int TileSize = 64;
-    private const int BoardRenderSize = TileSize * 8;
     private const int NumClasses = 13;
-    private const int PlaneLength = TileSize * TileSize;
-    private const int SampleFloatLength = 3 * PlaneLength;
     private const float InvHalfByte = 1.0f / 127.5f;
 
     // Порог среднего отличия пикселя (0..255) на клетке 64x64.
@@ -37,12 +33,17 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
     private readonly InferenceSession _session;
     private readonly string _inputName;
     private readonly string _outputName;
-    private readonly float[] _tensorBuffer = new float[64 * SampleFloatLength];
+    private readonly int _tileSize;
+    private readonly int _boardRenderSize;
+    private readonly int _planeLength;
+    private readonly int _sampleFloatLength;
     private readonly double[,,] _cachedScreenProbs = new double[8, 8, NumClasses];
     private readonly int[] _dirtyTiles = new int[64];
+    private float[] _tensorBuffer = Array.Empty<float>();
 
     private byte[] _pixelBuffer = Array.Empty<byte>();
     private byte[] _prevPixelBuffer = Array.Empty<byte>();
+    private Bitmap? _resizedBitmap;
     private int _prevStride;
     private bool _hasCache;
     private int _ticksSinceFullRefresh;
@@ -66,11 +67,22 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         _session = new InferenceSession(modelPath, options);
         _inputName = _session.InputMetadata.Keys.First();
         _outputName = _session.OutputMetadata.Keys.First();
-        logger?.Info($"ONNX-распознаватель загружен: {modelPath} (input={_inputName}, output={_outputName}).");
+
+        IReadOnlyList<int> inputDims = _session.InputMetadata[_inputName].Dimensions;
+        _tileSize = inputDims.Count == 4 && inputDims[2] > 0 && inputDims[2] == inputDims[3]
+            ? inputDims[2]
+            : 64;
+        _boardRenderSize = _tileSize * 8;
+        _planeLength = _tileSize * _tileSize;
+        _sampleFloatLength = 3 * _planeLength;
+        _tensorBuffer = new float[64 * _sampleFloatLength];
+
+        logger?.Info($"ONNX-распознаватель загружен: {modelPath} (input={_inputName}, output={_outputName}, tile={_tileSize}x{_tileSize}).");
     }
 
     public string EngineName => "OnnxBoardRecognizer";
     public bool IsReady => !_disposed;
+    public int TileSize => _tileSize;
     public double LastInferenceMs { get; private set; }
     public int LastDirtySquareCount { get; private set; }
     public bool LastBoardVisible { get; private set; } = true;
@@ -219,7 +231,7 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             var sw = Stopwatch.StartNew();
             int stride = CaptureResizedPixels(board);
 
-            if (!BoardPresenceChecker.IsCheckerboardPresent(_pixelBuffer, stride))
+            if (!BoardPresenceChecker.IsCheckerboardPresent(_pixelBuffer, stride, _tileSize))
             {
                 LastBoardVisible = false;
                 LastDirtySquareCount = 0;
@@ -243,10 +255,10 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             {
                 PackDirtyTilesToTensor(stride, dirtyCount);
 
-                int floatCount = dirtyCount * SampleFloatLength;
+                int floatCount = dirtyCount * _sampleFloatLength;
                 var inputTensor = new DenseTensor<float>(
                     _tensorBuffer.AsMemory(0, floatCount),
-                    new[] { dirtyCount, 3, TileSize, TileSize });
+                    new[] { dirtyCount, 3, _tileSize, _tileSize });
 
                 var inputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, inputTensor) };
                 using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> outputs = _session.Run(inputs);
@@ -286,25 +298,31 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
 
     private int CaptureResizedPixels(Bitmap sourceBoard)
     {
-        using var resized = new Bitmap(BoardRenderSize, BoardRenderSize, PixelFormat.Format24bppRgb);
+        if (_resizedBitmap == null || _resizedBitmap.Width != _boardRenderSize || _resizedBitmap.Height != _boardRenderSize)
+        {
+            _resizedBitmap?.Dispose();
+            _resizedBitmap = new Bitmap(_boardRenderSize, _boardRenderSize, PixelFormat.Format24bppRgb);
+        }
+
+        Bitmap resized = _resizedBitmap!;
         using (Graphics g = Graphics.FromImage(resized))
         {
             g.InterpolationMode = InterpolationMode.HighQualityBilinear;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             g.DrawImage(
                 sourceBoard,
-                new Rectangle(0, 0, BoardRenderSize, BoardRenderSize),
+                new Rectangle(0, 0, _boardRenderSize, _boardRenderSize),
                 new Rectangle(0, 0, sourceBoard.Width, sourceBoard.Height),
                 GraphicsUnit.Pixel);
         }
 
         BitmapData bmpData = resized.LockBits(
-            new Rectangle(0, 0, BoardRenderSize, BoardRenderSize),
+            new Rectangle(0, 0, _boardRenderSize, _boardRenderSize),
             ImageLockMode.ReadOnly,
             PixelFormat.Format24bppRgb);
 
         int stride = bmpData.Stride;
-        int totalBytes = stride * BoardRenderSize;
+        int totalBytes = stride * _boardRenderSize;
         if (_pixelBuffer.Length != totalBytes)
             _pixelBuffer = new byte[totalBytes];
 
@@ -331,21 +349,21 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         }
 
         // Проверяем каждый 2-й пиксель по X и Y (1024 точки на клетку) — < 0.4 мс на всю доску
-        const int sampledChannels = (TileSize / 2) * (TileSize / 2) * 3;
+        int sampledChannels = (_tileSize / 2) * (_tileSize / 2) * 3;
         long thresholdSum = (long)(DirtyTileMadThreshold * sampledChannels);
 
         for (int sr = 0; sr < 8; sr++)
         {
-            int yBase = sr * TileSize;
+            int yBase = sr * _tileSize;
             for (int sc = 0; sc < 8; sc++)
             {
-                int xBase = sc * TileSize;
+                int xBase = sc * _tileSize;
                 long diffSum = 0;
 
-                for (int ty = 0; ty < TileSize; ty += 2)
+                for (int ty = 0; ty < _tileSize; ty += 2)
                 {
                     int rowOffset = (yBase + ty) * stride;
-                    for (int tx = 0; tx < TileSize; tx += 2)
+                    for (int tx = 0; tx < _tileSize; tx += 2)
                     {
                         int px = rowOffset + (xBase + tx) * 3;
                         diffSum += Math.Abs(_pixelBuffer[px] - _prevPixelBuffer[px]);
@@ -369,20 +387,20 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             int tileIdx = _dirtyTiles[i];
             int sr = tileIdx >> 3;
             int sc = tileIdx & 7;
-            int yBase = sr * TileSize;
-            int xBase = sc * TileSize;
+            int yBase = sr * _tileSize;
+            int xBase = sc * _tileSize;
 
-            int sampleOffset = i * SampleFloatLength;
+            int sampleOffset = i * _sampleFloatLength;
             int rOffset = sampleOffset;
-            int gOffset = sampleOffset + PlaneLength;
-            int bOffset = sampleOffset + 2 * PlaneLength;
+            int gOffset = sampleOffset + _planeLength;
+            int bOffset = sampleOffset + 2 * _planeLength;
 
-            for (int ty = 0; ty < TileSize; ty++)
+            for (int ty = 0; ty < _tileSize; ty++)
             {
                 int srcRow = (yBase + ty) * stride;
-                int dstRow = ty * TileSize;
+                int dstRow = ty * _tileSize;
 
-                for (int tx = 0; tx < TileSize; tx++)
+                for (int tx = 0; tx < _tileSize; tx++)
                 {
                     int px = srcRow + (xBase + tx) * 3;
                     int dstIdx = dstRow + tx;
@@ -506,6 +524,8 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         {
             if (_disposed) return;
             _disposed = true;
+            _resizedBitmap?.Dispose();
+            _resizedBitmap = null;
             _session.Dispose();
         }
     }
