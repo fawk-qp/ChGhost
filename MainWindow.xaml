@@ -18,11 +18,11 @@
                            Text="CHESS GHOST [AI] • БЕЛЫЕ • ПАУЗА"/>
                 <TextBlock x:Name="StatusText" Foreground="#FFFFFF"
                            FontFamily="Consolas" FontSize="13" Margin="0,4,0,6"
-                           Text="1. Угол A8 -> Alt+1 | 2. Угол H1 -> Alt+2"/>
+                           Text="1. Угол A8 -> Alt+1 | 2. Угол H1 -> Alt+2 | Alt+F: авто"/>
                 <Border Height="1" Background="#33FFFFFF" Margin="0,2,0,6"/>
                 <TextBlock x:Name="HotkeysText" Foreground="#99AAB5"
                            FontFamily="Consolas" FontSize="11"
-                           Text="Alt+1/2: углы | Alt+F: авто | Alt+3: старт | Alt+4: правка | Alt+5: сброс&#x0a;Alt+H: стелс | Alt+G: скрыть | Alt+S: старт/пауза | Alt+C: цвет | Alt+Q: выход"/>
+                           Text="Alt+1/2: углы | Alt+F: авто | Alt+3: старт | Alt+4: правка | Alt+5: сброс&#x0a;Alt+H: Coach/Advisor | Alt+G: скрыть | Alt+S: старт/пауза | Alt+C: цвет | Alt+Q: выход"/>
             </StackPanel>
         </Border>
     </Canvas>

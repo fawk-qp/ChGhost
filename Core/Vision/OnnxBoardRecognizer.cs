@@ -34,6 +34,7 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
     private readonly string _inputName;
     private readonly string _outputName;
     private readonly int _tileSize;
+    private readonly bool _fixedBatchOne;
     private readonly int _boardRenderSize;
     private readonly int _planeLength;
     private readonly int _sampleFloatLength;
@@ -56,7 +57,7 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         if (!File.Exists(modelPath))
             throw new FileNotFoundException($"ONNX-модель не найдена: {modelPath}", modelPath);
 
-        var options = new SessionOptions
+        using var sessionOptions = new SessionOptions
         {
             GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
             ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
@@ -64,14 +65,10 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             InterOpNumThreads = 1
         };
 
-        _session = new InferenceSession(modelPath, options);
+        _session = new InferenceSession(modelPath, sessionOptions);
         _inputName = _session.InputMetadata.Keys.First();
         _outputName = _session.OutputMetadata.Keys.First();
-
-        IReadOnlyList<int> inputDims = _session.InputMetadata[_inputName].Dimensions;
-        _tileSize = inputDims.Count == 4 && inputDims[2] > 0 && inputDims[2] == inputDims[3]
-            ? inputDims[2]
-            : 64;
+        ValidateModelMetadata(_session, _inputName, _outputName, out _tileSize, out _fixedBatchOne);
         _boardRenderSize = _tileSize * 8;
         _planeLength = _tileSize * _tileSize;
         _sampleFloatLength = 3 * _planeLength;
@@ -255,25 +252,48 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             {
                 PackDirtyTilesToTensor(stride, dirtyCount);
 
-                int floatCount = dirtyCount * _sampleFloatLength;
-                var inputTensor = new DenseTensor<float>(
-                    _tensorBuffer.AsMemory(0, floatCount),
-                    new[] { dirtyCount, 3, _tileSize, _tileSize });
-
-                var inputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, inputTensor) };
-                using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> outputs = _session.Run(inputs);
-                Tensor<float> logitsTensor = outputs.First(v => v.Name == _outputName).AsTensor<float>();
-
                 Span<double> probs = stackalloc double[NumClasses];
-                for (int i = 0; i < dirtyCount; i++)
+                if (_fixedBatchOne)
                 {
-                    int tileIdx = _dirtyTiles[i];
-                    int sr = tileIdx >> 3;
-                    int sc = tileIdx & 7;
+                    for (int i = 0; i < dirtyCount; i++)
+                    {
+                        int tileIdx = _dirtyTiles[i];
+                        int sr = tileIdx >> 3;
+                        int sc = tileIdx & 7;
 
-                    ComputeSoftmax(logitsTensor, i, probs);
-                    for (int k = 0; k < NumClasses; k++)
-                        _cachedScreenProbs[sr, sc, k] = probs[k];
+                        var singleTensor = new DenseTensor<float>(
+                            _tensorBuffer.AsMemory(i * _sampleFloatLength, _sampleFloatLength),
+                            new[] { 1, 3, _tileSize, _tileSize });
+                        var singleInputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, singleTensor) };
+                        using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> singleOutputs = _session.Run(singleInputs);
+                        Tensor<float> singleLogits = singleOutputs.First(v => v.Name == _outputName).AsTensor<float>();
+
+                        ComputeSoftmax(singleLogits, 0, probs);
+                        for (int k = 0; k < NumClasses; k++)
+                            _cachedScreenProbs[sr, sc, k] = probs[k];
+                    }
+                }
+                else
+                {
+                    int floatCount = dirtyCount * _sampleFloatLength;
+                    var inputTensor = new DenseTensor<float>(
+                        _tensorBuffer.AsMemory(0, floatCount),
+                        new[] { dirtyCount, 3, _tileSize, _tileSize });
+
+                    var inputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, inputTensor) };
+                    using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> outputs = _session.Run(inputs);
+                    Tensor<float> logitsTensor = outputs.First(v => v.Name == _outputName).AsTensor<float>();
+
+                    for (int i = 0; i < dirtyCount; i++)
+                    {
+                        int tileIdx = _dirtyTiles[i];
+                        int sr = tileIdx >> 3;
+                        int sc = tileIdx & 7;
+
+                        ComputeSoftmax(logitsTensor, i, probs);
+                        for (int k = 0; k < NumClasses; k++)
+                            _cachedScreenProbs[sr, sc, k] = probs[k];
+                    }
                 }
 
                 // Сохраняем текущий буфер пикселей как эталон для следующего кадра
@@ -472,6 +492,37 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         }
 
         return new BoardRecognitionResult(grid, classScores, confidences, GridToFen(grid));
+    }
+
+    private static void ValidateModelMetadata(
+        InferenceSession session,
+        string inputName,
+        string outputName,
+        out int tileSize,
+        out bool fixedBatchOne)
+    {
+        var inDims = session.InputMetadata[inputName].Dimensions;
+        if (inDims.Length != 4)
+            throw new InvalidOperationException($"ONNX input '{inputName}' must have rank 4 (NCHW), got {inDims.Length}.");
+
+        if (inDims[1] != 3)
+            throw new InvalidOperationException($"ONNX input '{inputName}' must have 3 RGB channels, got {inDims[1]}.");
+
+        if (inDims[2] <= 0 || inDims[2] != inDims[3])
+            throw new InvalidOperationException($"ONNX input '{inputName}' must have positive square spatial dims, got {inDims[2]}x{inDims[3]}.");
+
+        if (inDims[0] <= 0)
+            fixedBatchOne = false;
+        else if (inDims[0] == 1)
+            fixedBatchOne = true;
+        else
+            throw new InvalidOperationException($"ONNX input '{inputName}' has unsupported fixed batch dimension: {inDims[0]}.");
+
+        var outDims = session.OutputMetadata[outputName].Dimensions;
+        if (outDims.Length != 2 || outDims[1] != 13)
+            throw new InvalidOperationException($"ONNX output '{outputName}' must have shape [B, 13], got [{string.Join(", ", outDims)}].");
+
+        tileSize = inDims[2];
     }
 
     private static void ComputeSoftmax(Tensor<float> logits, int batchIdx, Span<double> probs)

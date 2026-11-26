@@ -20,6 +20,9 @@ public sealed class StockfishEngine : IChessEngine
     private bool _disposed;
     private int _currentMultiPv = 1;
     private DateTime _lastUsedUtc = DateTime.UtcNow;
+    private readonly object _stdinLock = new();
+    private volatile bool _isSearching;
+    private StreamWriter? _stdin;
 
     public StockfishEngine(string executablePath, AppSettings settings, IAppLogger logger)
     {
@@ -217,6 +220,7 @@ public sealed class StockfishEngine : IChessEngine
             _job = job;
             _output = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
             _outputReader = ReadOutputAsync(process, _output.Writer);
+            _stdin = process.StandardInput;
             await WriteCommandAsync("uci", cancellationToken).ConfigureAwait(false);
             await WaitForLineAsync(line => line == "uciok", cancellationToken).ConfigureAwait(false);
 
@@ -287,23 +291,50 @@ public sealed class StockfishEngine : IChessEngine
         }
 
         await WriteCommandAsync($"position fen {fen}", cancellationToken).ConfigureAwait(false);
-        await WriteCommandAsync($"go movetime {Math.Clamp(moveTimeMs, 1, 60_000)}", cancellationToken).ConfigureAwait(false);
 
         var pvCandidates = new Dictionary<int, CandidateMove>();
-        string response = await WaitForLineAsync(
-                line => line.StartsWith("bestmove ", StringComparison.Ordinal),
-                cancellationToken,
-                line =>
-                {
-                    if (!TryParseInfoPvLine(line, out CandidateMove candidate))
-                        return;
-                    if (!pvCandidates.TryGetValue(candidate.MultiPvIndex, out CandidateMove? existing)
-                        || candidate.Depth >= existing.Depth)
+        bool receivedBestMove = false;
+        _isSearching = true;
+        using var stopReg = cancellationToken.Register(TrySendStopUnlocked);
+        string response;
+        try
+        {
+            WriteCommandLocked($"go movetime {Math.Clamp(moveTimeMs, 1, 60_000)}");
+            response = await WaitForLineAsync(
+                    line => line.StartsWith("bestmove ", StringComparison.Ordinal),
+                    cancellationToken,
+                    line =>
                     {
-                        pvCandidates[candidate.MultiPvIndex] = candidate;
-                    }
-                })
-            .ConfigureAwait(false);
+                        if (line.StartsWith("bestmove ", StringComparison.Ordinal))
+                            receivedBestMove = true;
+                        if (!TryParseInfoPvLine(line, out CandidateMove candidate))
+                            return;
+                        if (!pvCandidates.TryGetValue(candidate.MultiPvIndex, out CandidateMove? existing)
+                            || candidate.Depth >= existing.Depth)
+                        {
+                            pvCandidates[candidate.MultiPvIndex] = candidate;
+                        }
+                    })
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!receivedBestMove)
+            {
+                TrySendStopUnlocked();
+                bool drained = await TryDrainBestMoveAfterStopAsync(TimeSpan.FromMilliseconds(500)).ConfigureAwait(false);
+                if (!drained)
+                {
+                    _logger.Warn("Stockfish не завершил поиск после stop за 500 мс — перезапуск процесса.");
+                    KillProcessNoLock();
+                }
+            }
+            throw;
+        }
+        finally
+        {
+            _isSearching = false;
+        }
 
         string[] parts = response.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length < 2)
@@ -350,13 +381,88 @@ public sealed class StockfishEngine : IChessEngine
         }
     }
 
-    private async Task WriteCommandAsync(string command, CancellationToken cancellationToken)
+    private void WriteCommandLocked(string command)
+    {
+        lock (_stdinLock)
+        {
+            if (_process is { HasExited: false } && _stdin is not null)
+            {
+                _stdin.WriteLine(command);
+                _stdin.Flush();
+            }
+        }
+    }
+
+    private Task WriteCommandAsync(string command, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        WriteCommandLocked(command);
+        return Task.CompletedTask;
+    }
+
+    private void TrySendStopUnlocked()
+    {
+        if (!_isSearching) return;
+        try
+        {
+            WriteCommandLocked("stop");
+        }
+        catch
+        {
+            // Игнорируем, если процесс уже завершился
+        }
+    }
+
+    private async Task<bool> TryDrainBestMoveAfterStopAsync(TimeSpan timeout)
+    {
+        using var drainCts = new CancellationTokenSource(timeout);
+        try
+        {
+            await WaitForLineAsync(
+                line => line.StartsWith("bestmove ", StringComparison.Ordinal),
+                drainCts.Token);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void KillProcessNoLock()
     {
         Process? process = _process;
-        if (process == null || process.HasExited)
-            throw new InvalidOperationException("Stockfish is not running.");
-        await process.StandardInput.WriteLineAsync(command.AsMemory(), cancellationToken).ConfigureAwait(false);
-        await process.StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
+        ChildProcessJob? job = _job;
+        _process = null;
+        _job = null;
+        _outputReader = null;
+        _output = null;
+        _stdin = null;
+        _isSearching = false;
+
+        if (process == null)
+        {
+            job?.Dispose();
+            return;
+        }
+
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(250);
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            _logger.Error("Error while killing Stockfish after failed stop.", ex);
+        }
+        finally
+        {
+            job?.Dispose();
+            process.Dispose();
+        }
     }
 
     private void DrainOutput()
@@ -476,6 +582,8 @@ public sealed class StockfishEngine : IChessEngine
         _job = null;
         _outputReader = null;
         _output = null;
+        _stdin = null;
+        _isSearching = false;
 
         if (process == null)
         {
@@ -487,8 +595,11 @@ public sealed class StockfishEngine : IChessEngine
         {
             if (!process.HasExited && graceful)
             {
-                await process.StandardInput.WriteLineAsync("quit").ConfigureAwait(false);
-                await process.StandardInput.FlushAsync().ConfigureAwait(false);
+                lock (_stdinLock)
+                {
+                    process.StandardInput.WriteLine("quit");
+                    process.StandardInput.Flush();
+                }
                 try
                 {
                     await process.WaitForExitAsync().WaitAsync(TimeSpan.FromMilliseconds(500)).ConfigureAwait(false);
