@@ -1,14 +1,14 @@
-# ChGhost v2.2
+# ChGhost v2.2.1
 
-ChGhost is a Windows x64 WPF chess-assistance overlay. It captures the board region, recognizes pieces with ONNX computer vision, validates the resulting FEN, and queries Stockfish over UCI.
+ChGhost is a Windows x64 WPF chess overlay trainer. It captures the board region, recognizes pieces with ONNX computer vision, validates the resulting FEN, and queries Stockfish over UCI for position analysis, lesson plans, and alternative ideas.
 
 ## Features
 
 - **ONNX vision**: `TinyChessPieceNet` 48x48 (~0.46 MB) with Dirty-Square Gating. Tile size is read from the model input, so `pieces_64x64.onnx` remains a safe fallback.
 - **Board detection**: `BoardPresenceChecker` occlusion guard, `AutoBoardDetector`, and live `playAsBlack` auto-detection using pawn/weighted-row rules with cache reprojection (no extra ONNX pass).
 - **Engine**: asynchronous Stockfish UCI in a Job Object, MultiPV candidate collection, and idle auto-unload.
-- **Overlay**: `PerMonitorV2` DPI, click-through layered window, `WDA_EXCLUDEFROMCAPTURE`, `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`, hidden from the taskbar.
-- **Stealth/advisor**: `StealthHumanize` (`Alt+H`) selects human-like moves via `HumanMoveSelector` (MultiPV, temperature, max CP loss), contrast advisor arrows, and adaptive pacing.
+- **Overlay trainer**: `PerMonitorV2` DPI, click-through layered window, `WDA_EXCLUDEFROMCAPTURE`, `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`, hidden from the taskbar.
+- **Coach/advisor mode**: `StealthHumanize` (`Alt+H`) selects a candidate move via `HumanMoveSelector` (MultiPV, temperature, max CP loss), contrast advisor arrows, and adaptive pacing described as a pause for independent thinking before the hint arrow appears.
 
 ## Hotkeys
 
@@ -23,7 +23,7 @@ ChGhost is a Windows x64 WPF chess-assistance overlay. It captures the board reg
 | `Alt + S` | Toggle engine start/pause |
 | `Alt + R` | Force rescan (reset move tracking) |
 | `Alt + C` | Toggle side (play as Black) |
-| `Alt + H` | Toggle stealth humanized moves |
+| `Alt + H` | Toggle Coach / Advisor Mode |
 | `Alt + B` | Blitz / Rapid preset |
 | `Alt + E` | Toggle full engine strength / target Elo |
 | `Alt + P` | Switch profile 1-3 |
@@ -45,13 +45,13 @@ ChGhost is a Windows x64 WPF chess-assistance overlay. It captures the board reg
 | `ScanIntervalBlitzMs` / `ScanIntervalRapidMs` | `120` / `450` | Board scan interval per preset |
 | `CommandTimeoutMs` | `3500` | UCI command timeout |
 | `ExcludeFromCapture` | `true` | Hide overlay from capture APIs |
-| `StealthHumanize` | `true` | Human-like move selection |
+| `StealthHumanize` | `true` | Coach / Advisor mode candidate move selection |
 | `MultiPvCount` | `4` | MultiPV lines collected for humanizer/advisor |
-| `HumanMaxCpLoss` / `HumanTemperature` | `45` / `32` | Humanizer quality loss / randomness |
+| `HumanMaxCpLoss` / `HumanTemperature` | `45` / `32` | Coach quality loss / randomness |
 | `ShowAdvisorArrows` / `AdvisorMaxGapCp` | `true` / `65` | Advisor arrows and max CP gap |
 | `AdvisorArrowColor1` / `AdvisorArrowColor2` | `#00E5FF` / `#E040FB` | Advisor arrow colors |
 | `AdvisorArrowOpacity` | `0.82` | Advisor arrow opacity |
-| `HumanPacingEnabled` / `HumanDelay*Ms` | `true` / `120-950` blitz, `400-2600` rapid | Adaptive move pacing delays |
+| `HumanPacingEnabled` / `HumanDelay*Ms` | `true` / `120-950` blitz, `400-2600` rapid | Pause for independent thinking before hint arrows |
 | `EngineIdleUnloadSeconds` | `90` | Unload Stockfish after idle period |
 
 ## Build and test

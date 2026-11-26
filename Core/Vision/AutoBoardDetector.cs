@@ -321,7 +321,7 @@ public sealed class AutoBoardDetector : IBoardDetector
             int minY = Math.Max(0, (int)Math.Round(centY) - boxRadius);
             int maxY = Math.Min(wh - 1, (int)Math.Round(centY) + boxRadius);
             int minX = Math.Max(0, (int)Math.Round(centX) - boxRadius);
-            int maxX = Math.Min(wh - 1, (int)Math.Round(centX) + boxRadius);
+            int maxX = Math.Min(ww - 1, (int)Math.Round(centX) + boxRadius);
             for (int ny = minY; ny <= maxY; ny++)
             {
                 int nrow = ny * ww;

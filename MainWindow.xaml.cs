@@ -5,6 +5,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -35,7 +36,7 @@ namespace ChGhost
         private readonly AppSettings _settings;
         private readonly string _enginePath;
         private readonly IChessEngine _engine;
-        private readonly CancellationTokenSource _appLifetime = new();
+        private readonly CancellationTokenSource _appLifetimeCts = new();
         private readonly Random _rng = new();
         private int _activeProfile = 1;
         private readonly IBoardRecognizer _recognizer;
@@ -69,10 +70,17 @@ namespace ChGhost
         private bool _isHidden = false;
         private bool _showDebugOverlay = true;
         private bool _isBlitzTurboMode = true;
-        private bool _closing;
-        private bool _allowClose;
         private string _startupWarning = "";
         private readonly HashSet<int> _registeredHotkeys = new();
+        private long _stateVersion;
+        private bool _shutdownStarted;
+        private bool _readyToClose;
+        private Task? _activeScanTask;
+        private CancellationTokenSource? _scanCts;
+        private int _rescanRequested;
+        private int _rescanForce;
+        private System.Drawing.Rectangle _overlayMonitorBounds = System.Drawing.Rectangle.Empty;
+        private bool _isAutoDetecting;
 
         private readonly DispatcherTimer _scanTimer = new();
         private string _lastBestMove = "";
@@ -103,7 +111,7 @@ namespace ChGhost
             UpdateUI();
 
             ApplySpeedPreset();
-            _scanTimer.Tick += async (_, _) => await ScanAndSuggestAsync();
+            _scanTimer.Tick += (_, _) => _ = RunScanAndSuggestAsync();
         }
 
         private IBoardRecognizer CreateRecognizer()
@@ -223,6 +231,21 @@ namespace ChGhost
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
+            if (msg == Win32Interop.WmDpiChanged)
+            {
+                Dispatcher.BeginInvoke(() =>
+                {
+                    if (HasValidBoardBounds())
+                    {
+                        BoardRect? b = _boardDetector.Detect();
+                        if (b.HasValue)
+                            ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(b.Value.Left, b.Value.Top, b.Value.Width, b.Value.Height));
+                    }
+                    RedrawOverlay();
+                });
+                return IntPtr.Zero;
+            }
+
             if (msg == Win32Interop.WmHotkey)
             {
                 int id = wParam.ToInt32();
@@ -244,17 +267,23 @@ namespace ChGhost
                     case 1:
                         _topLeft = cursor;
                         SaveConfig();
+                        ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(cursor.X, cursor.Y, 1, 1));
                         DrawCalibrationGrid();
                         InvalidateOnnxCache();
                         UpdateUI($"[П{_activeProfile}] Угол A8 задан ({_topLeft.X}, {_topLeft.Y}) -> теперь Alt+2 на H1");
+                        InvalidateScanState(requestRescan: _isRunning);
                         break;
 
                     case 2:
                         _bottomRight = cursor;
                         SaveConfig();
+                        BoardRect? bounds = _boardDetector.Detect();
+                        if (bounds.HasValue)
+                            ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(bounds.Value.Left, bounds.Value.Top, bounds.Value.Width, bounds.Value.Height));
                         DrawCalibrationGrid();
                         InvalidateOnnxCache();
                         UpdateUI($"[П{_activeProfile}] Углы заданы! Нажмите Alt+3 на старте партии.");
+                        InvalidateScanState(requestRescan: _isRunning);
                         break;
 
                     case 3:
@@ -287,6 +316,7 @@ namespace ChGhost
                         ResetBoardTracking();
                         RedrawOverlay();
                         UpdateUI();
+                        InvalidateScanState(requestRescan: _isRunning, forceCalculate: true);
                         break;
 
                     case 8:
@@ -297,21 +327,32 @@ namespace ChGhost
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
                         {
-                            _logger.Error("Unable to save settings after changing stealth mode.", ex);
+                            _logger.Error("Unable to save settings after changing coach mode.", ex);
                             _startupWarning = "Не удалось сохранить настройки.";
                         }
                         _logger.Info($"StealthHumanize={_settings.StealthHumanize}");
-                        UpdateUI($"StealthHumanize: {(_settings.StealthHumanize ? "ON" : "OFF")}");
+                        UpdateUI($"Режим тренера (Coach/Advisor): {(_settings.StealthHumanize ? "ON" : "OFF")}");
+                        InvalidateScanState(requestRescan: _isRunning, forceCalculate: true);
                         break;
-
                     case 9:
-                        Close();
+                        _settings.HumanPacingEnabled = !_settings.HumanPacingEnabled;
+                        try
+                        {
+                            _settingsStore.Save(_settings);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+                        {
+                            _logger.Error("Unable to save settings after changing human pacing.", ex);
+                            _startupWarning = "Не удалось сохранить настройки.";
+                        }
+                        UpdateUI($"Пауза на обдумывание: {(_settings.HumanPacingEnabled ? "ON" : "OFF")}");
+                        InvalidateScanState(requestRescan: _isRunning, forceCalculate: true);
                         break;
 
                     case 10:
                         ResetBoardTracking();
                         RedrawOverlay();
-                        _ = ScanAndSuggestAsync(forceCalculate: true);
+                        _ = RunScanAndSuggestAsync(forceCalculate: true);
                         break;
 
                     case 11:
@@ -322,7 +363,7 @@ namespace ChGhost
 
                     case 12:
                         if (CalibratableRecognizer == null || !HasValidBoardBounds())
-                            TryAutoDetectBoard();
+                            _ = TryAutoDetectBoardAsync();
                         else
                             ManualFixPieceAtCursor(cursor);
                         break;
@@ -351,7 +392,7 @@ namespace ChGhost
                         }
                         _ = RestartEngineAsync();
                         UpdateUI();
-                        if (_isRunning) _ = ScanAndSuggestAsync(forceCalculate: true);
+                        if (_isRunning) _ = RunScanAndSuggestAsync(forceCalculate: true);
                         break;
 
                     case 16:
@@ -365,6 +406,7 @@ namespace ChGhost
 
         private void SwitchProfile()
         {
+            InvalidateScanState(requestRescan: _isRunning, forceCalculate: true);
             _activeProfile = (_activeProfile % PROFILE_COUNT) + 1;
             _boardDetector.Reset();
             CalibratableRecognizer?.ResetCalibration();
@@ -376,7 +418,7 @@ namespace ChGhost
             {
                 UpdateUI($"Включён Профиль {_activeProfile} -> синхронизирую доску...");
                 if (_isRunning)
-                    _ = ScanAndSuggestAsync(forceCalculate: true);
+                    _ = RunScanAndSuggestAsync(forceCalculate: true);
             }
             else if (HasValidBoardBounds())
             {
@@ -416,6 +458,7 @@ namespace ChGhost
 
             _topLeft = new Point(rect.Left, rect.Top);
             _bottomRight = new Point(rect.Right, rect.Bottom);
+            ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(rect.Left, rect.Top, rect.Width, rect.Height));
             SaveConfig();
 
             if (_recognizer is OnnxBoardRecognizer onnxRec)
@@ -441,8 +484,63 @@ namespace ChGhost
             _logger.Info($"[AUTODETECT] Board found: {rect.Left},{rect.Top} -> {rect.Right},{rect.Bottom} ({rect.Width}x{rect.Height}) | corners={diag.MatchedCorners}/49 | parity={diag.ParitySquares}/64 | ms={diag.ElapsedMs:F1}");
             UpdateUI($"Доска найдена автоматически ({rect.Width}x{rect.Height})");
             if (triggerScanAfter)
-                _ = ScanAndSuggestAsync(forceCalculate: true);
+                _ = RunScanAndSuggestAsync(forceCalculate: true);
             return true;
+        }
+
+        private async Task TryAutoDetectBoardAsync(bool triggerScanAfter = true)
+        {
+            if (_isAutoDetecting || _shutdownStarted)
+                return;
+            _isAutoDetecting = true;
+            try
+            {
+                BoardDetectionDiagnostics diag = await Task.Run(() => _autoBoardDetector.DetectWithDiagnostics());
+                if (diag.Rect is not { } rect)
+                {
+                    _logger.Warn("Auto board detection did not find a chessboard.");
+                    UpdateUI("Доска не найдена на экране (Alt+1 / Alt+2 вручную)");
+                    return;
+                }
+
+                _topLeft = new Point(rect.Left, rect.Top);
+                _bottomRight = new Point(rect.Right, rect.Bottom);
+                ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(rect.Left, rect.Top, rect.Width, rect.Height));
+                SaveConfig();
+
+                if (_recognizer is OnnxBoardRecognizer onnxRec)
+                {
+                    try
+                    {
+                        onnxRec.InvalidateCache();
+                        using Bitmap boardBmp = CaptureBoardSnapshot();
+                        BoardRecognitionResult recognition = onnxRec.Recognize(boardBmp, _playAsBlack);
+                        bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(recognition.RawGrid, _playAsBlack);
+                        if (detected.HasValue)
+                            _playAsBlack = detected.Value;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error("ONNX side auto-detection after board autodetect failed.", ex);
+                    }
+                }
+
+                ResetBoardTracking();
+                DrawCalibrationGrid();
+                _logger.Info($"[AUTODETECT] Board found: {rect.Left},{rect.Top} -> {rect.Right},{rect.Bottom} ({rect.Width}x{rect.Height}) | corners={diag.MatchedCorners}/49 | parity={diag.ParitySquares}/64 | ms={diag.ElapsedMs:F1}");
+                UpdateUI($"Доска найдена автоматически ({rect.Width}x{rect.Height})");
+                if (triggerScanAfter)
+                    _ = RunScanAndSuggestAsync(forceCalculate: true);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Auto board detection failed.", ex);
+                UpdateUI($"Автопоиск доски не удался: {ex.Message}");
+            }
+            finally
+            {
+                _isAutoDetecting = false;
+            }
         }
 
         private void SmartAlt3Action()
@@ -472,7 +570,7 @@ namespace ChGhost
                     _scanTimer.Start();
                 }
                 UpdateUI("[AI] Полный пересчёт позиции с чистого листа -> считаю ход...");
-                _ = ScanAndSuggestAsync(forceCalculate: true);
+                _ = RunScanAndSuggestAsync(forceCalculate: true);
                 return;
             }
 
@@ -518,7 +616,7 @@ namespace ChGhost
             }
 
             UpdateUI("Полный пересчёт позиции с чистого листа -> считаю ход...");
-            _ = ScanAndSuggestAsync(forceCalculate: true);
+            _ = RunScanAndSuggestAsync(forceCalculate: true);
         }
 
         private void TryDetectOnnxPlayAsBlack(OnnxBoardRecognizer onnxRecognizer)
@@ -594,7 +692,7 @@ namespace ChGhost
                 ResetBoardTracking();
                 UpdateUI($"Обновлено: [{savedName}]! Далее: [{_manualFixOrder[_fixIndex].name}]");
                 if (_isRunning)
-                    _ = ScanAndSuggestAsync(forceCalculate: true);
+                    _ = RunScanAndSuggestAsync(forceCalculate: true);
             }
         }
 
@@ -629,6 +727,18 @@ namespace ChGhost
             _advisorMoves.Clear();
         }
 
+        private void InvalidateScanState(bool requestRescan = false, bool forceCalculate = false)
+        {
+            Interlocked.Increment(ref _stateVersion);
+            try { _scanCts?.Cancel(); } catch { }
+
+            if (requestRescan && !_shutdownStarted)
+            {
+                Interlocked.Exchange(ref _rescanRequested, 1);
+                if (forceCalculate) Interlocked.Exchange(ref _rescanForce, 1);
+            }
+        }
+
         private void CancelHumanDelay()
         {
             try
@@ -644,10 +754,10 @@ namespace ChGhost
         {
             try
             {
-                await _engine.NewGameAsync(_appLifetime.Token);
-                await ScanAndSuggestAsync(forceCalculate: true);
+                await _engine.NewGameAsync(_appLifetimeCts.Token);
+                await RunScanAndSuggestAsync(forceCalculate: true);
             }
-            catch (OperationCanceledException) when (_appLifetime.IsCancellationRequested)
+            catch (OperationCanceledException) when (_appLifetimeCts.IsCancellationRequested)
             {
                 _logger.Info("New-game request cancelled during application shutdown.");
             }
@@ -662,11 +772,11 @@ namespace ChGhost
         {
             try
             {
-                await _engine.RestartAsync(_appLifetime.Token);
+                await _engine.RestartAsync(_appLifetimeCts.Token);
                 if (_isRunning)
-                    await ScanAndSuggestAsync(forceCalculate: true);
+                    await RunScanAndSuggestAsync(forceCalculate: true);
             }
-            catch (OperationCanceledException) when (_appLifetime.IsCancellationRequested)
+            catch (OperationCanceledException) when (_appLifetimeCts.IsCancellationRequested)
             {
                 _logger.Info("Engine restart cancelled during application shutdown.");
             }
@@ -707,7 +817,7 @@ namespace ChGhost
             string powerText = _settings.FullStrength ? $"MAX • {_settings.EffectiveEngineThreads}T" : _settings.TargetElo.ToString();
 
             string recognizerText = CalibratableRecognizer == null
-                ? (_settings.StealthHumanize ? "[AI·S]" : "[AI]")
+                ? (_settings.StealthHumanize ? "[AI·C]" : "[AI]")
                 : $"[П{_activeProfile}]";
             HeaderText.Text = $"CHESS GHOST {recognizerText} • {sideText} • {stateText} • {speedText} ({powerText})";
             HeaderText.Foreground = _isRunning
@@ -905,7 +1015,7 @@ namespace ChGhost
                 ResetBoardTracking();
                 ClearGraphics();
                 _scanTimer.Start();
-                _ = ScanAndSuggestAsync(forceCalculate: true);
+                _ = RunScanAndSuggestAsync(forceCalculate: true);
             }
             else
             {
@@ -964,6 +1074,25 @@ namespace ChGhost
             return new System.Windows.Rect(topLeft, bottomRight);
         }
 
+        private void ApplyOverlayMonitorBounds(System.Drawing.Rectangle boardRect)
+        {
+            if (!Win32Interop.TryGetMonitorBoundsForRect(boardRect, out var monBounds, out bool fullyContained))
+                return;
+            if (!fullyContained)
+                _logger.Warn($"Board rect crosses monitor bounds: board={boardRect}, monitor={monBounds}");
+            _overlayMonitorBounds = monBounds;
+            try
+            {
+                WindowState = WindowState.Normal;
+                IntPtr hwnd = new WindowInteropHelper(this).Handle;
+                Win32Interop.SetOverlayBoundsNoActivate(hwnd, monBounds);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"SetOverlayBoundsNoActivate failed: {ex.Message}");
+            }
+        }
+
         private System.Windows.Point ScreenToOverlayDip(Point screenPoint)
         {
             PresentationSource? source = PresentationSource.FromVisual(this);
@@ -972,9 +1101,11 @@ namespace ChGhost
 
             IntPtr hwnd = new WindowInteropHelper(this).Handle;
             System.Drawing.Rectangle windowBounds = Win32Interop.GetWindowRectangle(hwnd);
+            int offsetX = !_overlayMonitorBounds.IsEmpty ? _overlayMonitorBounds.Left : windowBounds.Left;
+            int offsetY = !_overlayMonitorBounds.IsEmpty ? _overlayMonitorBounds.Top : windowBounds.Top;
             var clientPoint = new System.Windows.Point(
-                screenPoint.X - windowBounds.Left,
-                screenPoint.Y - windowBounds.Top);
+                screenPoint.X - offsetX,
+                screenPoint.Y - offsetY);
             return source.CompositionTarget.TransformFromDevice.Transform(clientPoint);
         }
 
@@ -1039,6 +1170,10 @@ namespace ChGhost
                 return;
 
             _isScanning = true;
+            _scanCts = CancellationTokenSource.CreateLinkedTokenSource(_appLifetimeCts.Token);
+            CancellationToken scanToken = _scanCts.Token;
+            long versionSnap = Interlocked.Read(ref _stateVersion);
+            bool IsStale() => _shutdownStarted || versionSnap != Interlocked.Read(ref _stateVersion);
             bool playAsBlackSnap = _playAsBlack;
             _activeFen = null;
             double inferMs = 0;
@@ -1050,6 +1185,7 @@ namespace ChGhost
                     Bitmap bmp = CaptureBoard();
                     return _recognizer.Recognize(bmp, playAsBlackSnap);
                 });
+                if (IsStale()) return;
 
                 if (_recognizer is OnnxBoardRecognizer onnxRecognizer)
                 {
@@ -1081,7 +1217,8 @@ namespace ChGhost
                     }
                 }
 
-                _appLifetime.Token.ThrowIfCancellationRequested();
+                scanToken.ThrowIfCancellationRequested();
+                if (IsStale()) return;
                 TrackingUpdate tracking = _gameStateTracker.Update(recognition, forceCalculate, playAsBlackSnap);
                 if (tracking.IsDebounced)
                 {
@@ -1127,7 +1264,7 @@ namespace ChGhost
                 }
 
                 char turn = playAsBlackSnap ? 'b' : 'w';
-                string fullFen = $"{tracking.StableFen} {turn} {tracking.CastlingRights} - 0 1";
+                string fullFen = $"{tracking.StableFen} {turn} {tracking.CastlingRights} {tracking.EnPassantTarget} {tracking.HalfmoveClock} {tracking.FullmoveNumber}";
                 _activeFen = fullFen;
                 int moveTimeMs = _isBlitzTurboMode ? _settings.MoveTimeBlitzMs : _settings.MoveTimeRapidMs;
 
@@ -1156,12 +1293,12 @@ namespace ChGhost
                 var sfStopwatch = System.Diagnostics.Stopwatch.StartNew();
                 if (useHumanizer)
                 {
-                    candidates = await _engine.GetTopMovesAsync(fullFen, moveTimeMs, requestedMultiPv, _appLifetime.Token);
+                    candidates = await _engine.GetTopMovesAsync(fullFen, moveTimeMs, requestedMultiPv, scanToken);
                     pvCount = candidates.Count;
                 }
                 else
                 {
-                    bestMove = await _engine.GetBestMoveAsync(fullFen, moveTimeMs, _appLifetime.Token);
+                    bestMove = await _engine.GetBestMoveAsync(fullFen, moveTimeMs, scanToken);
                 }
                 sfStopwatch.Stop();
 
@@ -1191,13 +1328,13 @@ namespace ChGhost
 
                         if (_settings.HumanPacingEnabled && rec.RecommendedDelayMs > 0 && !forceCalculate)
                         {
-                            var delayCts = CancellationTokenSource.CreateLinkedTokenSource(_appLifetime.Token);
+                            var delayCts = CancellationTokenSource.CreateLinkedTokenSource(scanToken);
                             _humanDelayCts = delayCts;
                             try
                             {
                                 await Task.Delay(rec.RecommendedDelayMs, delayCts.Token);
                             }
-                            catch (OperationCanceledException) when (!_appLifetime.IsCancellationRequested)
+                            catch (OperationCanceledException) when (!_appLifetimeCts.IsCancellationRequested)
                             {
                                 return;
                             }
@@ -1254,9 +1391,9 @@ namespace ChGhost
                     UpdateUI();
                 }
             }
-            catch (OperationCanceledException) when (_appLifetime.IsCancellationRequested)
+            catch (OperationCanceledException) when (_appLifetimeCts.IsCancellationRequested || (_scanCts?.IsCancellationRequested ?? false))
             {
-                _logger.Info("Board scan cancelled during application shutdown.");
+                _logger.Info("Board scan cancelled.");
             }
             catch (Exception ex)
             {
@@ -1269,8 +1406,42 @@ namespace ChGhost
             finally
             {
                 _isScanning = false;
+                CancellationTokenSource? scanCtsLocal = _scanCts;
+                _scanCts = null;
+                try { scanCtsLocal?.Dispose(); } catch { }
+                if (!_shutdownStarted && Interlocked.Exchange(ref _rescanRequested, 0) == 1)
+                {
+                    bool force = Interlocked.Exchange(ref _rescanForce, 0) == 1;
+                    _ = Dispatcher.BeginInvoke(async delegate
+                    {
+                        await RunScanAndSuggestAsync(forceCalculate: force).ConfigureAwait(false);
+                    });
+                }
             }
         }
+        private void ScheduleRescanSync(bool forceCalculate)
+        {
+            if (_shutdownStarted)
+                return;
+            _ = RunScanAndSuggestAsync(forceCalculate);
+        }
+
+        private Task RunScanAndSuggestAsync(bool forceCalculate = false)
+        {
+            if (_shutdownStarted)
+                return Task.CompletedTask;
+            Task task = ScanAndSuggestAsync(forceCalculate);
+            _activeScanTask = task;
+            task.ContinueWith(
+                _ =>
+                {
+                    if (ReferenceEquals(_activeScanTask, task))
+                        _activeScanTask = null;
+                },
+                TaskScheduler.Default);
+            return task;
+        }
+
         private void ClearGraphics()
         {
             for (int i = OverlayCanvas.Children.Count - 1; i >= 0; i--)
@@ -1465,49 +1636,58 @@ namespace ChGhost
             OverlayCanvas.Children.Add(arrowHead);
         }
 
-        protected override async void OnClosing(CancelEventArgs e)
+        protected override void OnClosing(CancelEventArgs e)
         {
-            if (!_allowClose)
+            if (_readyToClose)
             {
-                e.Cancel = true;
                 base.OnClosing(e);
-                if (_closing)
-                    return;
-
-                _closing = true;
-                _appLifetime.Cancel();
-                _scanTimer.Stop();
-                CancelHumanDelay();
-                _captureBitmap?.Dispose();
-                _captureBitmap = null;
-                UnregisterHotKeys();
-                try
-                {
-                    await _engine.DisposeAsync();
-                }
-                catch (Exception ex)
-                {
-                    _logger.Error("Error while disposing chess engine during shutdown.", ex);
-                }
-                if (_recognizer is IDisposable disposableRecognizer)
-                {
-                    try
-                    {
-                        disposableRecognizer.Dispose();
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Error("Error while disposing board recognizer during shutdown.", ex);
-                    }
-                }
-                _appLifetime.Dispose();
-                _allowClose = true;
-                Close();
                 return;
             }
 
-            base.OnClosing(e);
+            e.Cancel = true;
+            if (_shutdownStarted) return;
+            _shutdownStarted = true;
+
+            try { _scanTimer.Stop(); } catch { }
+            try { UnregisterAllHotkeys(); } catch { }
+            try { _scanCts?.Cancel(); } catch { }
+            try { _appLifetimeCts.Cancel(); } catch { }
+
+            _ = ShutdownAndCloseAsync();
         }
+
+        private async Task ShutdownAndCloseAsync()
+        {
+            try
+            {
+                var scanTask = _activeScanTask;
+                if (scanTask is not null)
+                {
+                    try { await Task.WhenAny(scanTask, Task.Delay(1500)); } catch { }
+                }
+
+                try { _captureBitmap?.Dispose(); _captureBitmap = null; } catch { }
+                try { (_recognizer as IDisposable)?.Dispose(); } catch { }
+                try
+                {
+                    if (_engine is IAsyncDisposable asyncEng)
+                        await Task.WhenAny(asyncEng.DisposeAsync().AsTask(), Task.Delay(1500));
+                    else
+                        (_engine as IDisposable)?.Dispose();
+                }
+                catch { }
+
+                try { _scanCts?.Dispose(); } catch { }
+                try { _appLifetimeCts.Dispose(); } catch { }
+            }
+            finally
+            {
+                _readyToClose = true;
+                Close();
+            }
+        }
+
+        private void UnregisterAllHotkeys() => UnregisterHotKeys();
 
         private void UnregisterHotKeys()
         {

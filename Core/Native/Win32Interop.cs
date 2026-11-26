@@ -21,6 +21,11 @@ public static class Win32Interop
     private const int SM_YVIRTUALSCREEN = 77;
     private const int SM_CXVIRTUALSCREEN = 78;
     private const int SM_CYVIRTUALSCREEN = 79;
+    private const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
+    private const uint SWP_NOZORDER = 0x0004;
+    private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_FRAMECHANGED = 0x0020;
+    public const int WmDpiChanged = 0x02E0;
 
     public static bool TrySetWindowDisplayAffinity(IntPtr window, uint affinity, out int errorCode)
     {
@@ -98,6 +103,59 @@ public static class Win32Interop
         return width > 0 && height > 0 ? new Rectangle(x, y, width, height) : Rectangle.Empty;
     }
 
+    public static IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex)
+        => IntPtr.Size == 8
+            ? NativeMethods.GetWindowLongPtr64(hWnd, nIndex)
+            : new IntPtr(NativeMethods.GetWindowLong32(hWnd, nIndex));
+
+    public static IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong)
+        => IntPtr.Size == 8
+            ? NativeMethods.SetWindowLongPtr64(hWnd, nIndex, dwNewLong)
+            : new IntPtr(NativeMethods.SetWindowLong32(hWnd, nIndex, dwNewLong.ToInt32()));
+
+    public static bool TryGetMonitorBoundsForRect(
+        Rectangle rect, out Rectangle monitorBounds, out bool fullyContained)
+    {
+        var r = new RECT { Left = rect.Left, Top = rect.Top, Right = rect.Right, Bottom = rect.Bottom };
+        IntPtr hMon = NativeMethods.MonitorFromRect(ref r, MONITOR_DEFAULTTONEAREST);
+        if (hMon != IntPtr.Zero)
+        {
+            var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+            if (NativeMethods.GetMonitorInfoW(hMon, ref mi))
+            {
+                monitorBounds = Rectangle.FromLTRB(
+                    mi.rcMonitor.Left, mi.rcMonitor.Top, mi.rcMonitor.Right, mi.rcMonitor.Bottom);
+                fullyContained = rect.Left >= monitorBounds.Left
+                    && rect.Top >= monitorBounds.Top
+                    && rect.Right <= monitorBounds.Right
+                    && rect.Bottom <= monitorBounds.Bottom;
+                return true;
+            }
+        }
+
+        monitorBounds = GetVirtualScreenBounds();
+        fullyContained = false;
+        return false;
+    }
+
+    public static bool SetOverlayBoundsNoActivate(IntPtr hwnd, Rectangle physicalBounds)
+        => NativeMethods.SetWindowPos(
+            hwnd, IntPtr.Zero,
+            physicalBounds.Left, physicalBounds.Top, physicalBounds.Width, physicalBounds.Height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeRect
     {
@@ -137,6 +195,30 @@ public static class Win32Interop
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool GetWindowRect(IntPtr window, out NativeRect rectangle);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+        internal static extern int GetWindowLong32(IntPtr window, int index);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+        internal static extern IntPtr GetWindowLongPtr64(IntPtr window, int index);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
+        internal static extern int SetWindowLong32(IntPtr window, int index, int value);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
+        internal static extern IntPtr SetWindowLongPtr64(IntPtr window, int index, IntPtr value);
+
+        [DllImport("user32.dll")]
+        internal static extern IntPtr MonitorFromRect(ref RECT lprc, uint dwFlags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool SetWindowPos(
+            IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
         [DllImport("user32.dll")]
         internal static extern int GetSystemMetrics(int nIndex);

@@ -5,6 +5,9 @@ public sealed class TrackingUpdate
     public required char[,] Grid { get; init; }
     public required string StableFen { get; init; }
     public required string CastlingRights { get; init; }
+    public string EnPassantTarget { get; init; } = "-";
+    public int HalfmoveClock { get; init; }
+    public int FullmoveNumber { get; init; } = 1;
     public bool IsDebounced { get; init; }
     public bool IsValid { get; init; } = true;
     public bool IsUnchanged { get; init; }

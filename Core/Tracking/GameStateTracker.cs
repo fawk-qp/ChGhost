@@ -11,12 +11,14 @@ public sealed class GameStateTracker
     private char[,]? _confirmedGrid;
     private string _lastRawFen = "";
     private string _lastStableFen = "";
+    private readonly ChessHistoryTracker _history = new();
 
     public void Reset()
     {
         _confirmedGrid = null;
         _lastRawFen = "";
         _lastStableFen = "";
+        _history.Reset();
     }
 
     public TrackingUpdate Update(BoardRecognitionResult recognition, bool forceCalculate, bool playAsBlack)
@@ -80,13 +82,18 @@ public sealed class GameStateTracker
             };
         }
 
+        ChessHistorySnapshot history = _history.Update(stableGrid);
+
         if (!forceCalculate && stableFen == _lastStableFen)
         {
             return new TrackingUpdate
             {
                 Grid = stableGrid,
                 StableFen = stableFen,
-                CastlingRights = castlingRights,
+                CastlingRights = history.CastlingFen,
+                EnPassantTarget = history.EnPassantTarget,
+                HalfmoveClock = history.HalfmoveClock,
+                FullmoveNumber = history.FullmoveNumber,
                 IsUnchanged = true,
                 WhiteKings = whiteKings,
                 BlackKings = blackKings
@@ -123,7 +130,10 @@ public sealed class GameStateTracker
                 {
                     Grid = stableGrid,
                     StableFen = stableFen,
-                    CastlingRights = castlingRights,
+                    CastlingRights = history.CastlingFen,
+                    EnPassantTarget = history.EnPassantTarget,
+                    HalfmoveClock = history.HalfmoveClock,
+                    FullmoveNumber = history.FullmoveNumber,
                     IsWaitingForOpponent = true,
                     WhiteKings = whiteKings,
                     BlackKings = blackKings
@@ -139,7 +149,10 @@ public sealed class GameStateTracker
         {
             Grid = stableGrid,
             StableFen = stableFen,
-            CastlingRights = castlingRights,
+            CastlingRights = history.CastlingFen,
+            EnPassantTarget = history.EnPassantTarget,
+            HalfmoveClock = history.HalfmoveClock,
+            FullmoveNumber = history.FullmoveNumber,
             ShouldCalculateMove = isMyTurn,
             WhiteKings = whiteKings,
             BlackKings = blackKings
