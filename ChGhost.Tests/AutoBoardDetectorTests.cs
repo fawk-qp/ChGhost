@@ -48,6 +48,17 @@ public class AutoBoardDetectorTests
     }
 
     [Fact]
+    public void Detect_WideFrameWithRightSideBoard_FindsExactBounds()
+    {
+        using Bitmap screen = CreateWideScreenWithRightBoard();
+
+        BoardDetectionDiagnostics diag = new AutoBoardDetector().DetectWithDiagnostics(screen);
+
+        Assert.NotNull(diag.Rect);
+        AssertRectClose(diag.Rect!.Value, 1200, 80, 1600, 480, tolerance: 4);
+    }
+
+    [Fact]
     public void Detect_PartiallyOccludedBoardWithCoordinates_StillFindsExactBounds()
     {
         using Bitmap screen = CreateBrowserScreen(
@@ -225,6 +236,31 @@ public class AutoBoardDetectorTests
             graphics.FillRectangle(banner, new RectangleF(left + 2 * cell, top + 3 * cell, 4 * cell, 2 * cell));
             graphics.FillRectangle(banner, new RectangleF(left + 3 * cell, top + 2 * cell, 2 * cell, 4 * cell));
         }
+    }
+
+    private static Bitmap CreateWideScreenWithRightBoard()
+    {
+        var bitmap = new Bitmap(1920, 600, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+        using Graphics graphics = Graphics.FromImage(bitmap);
+        graphics.SmoothingMode = SmoothingMode.None;
+        graphics.PixelOffsetMode = PixelOffsetMode.None;
+        graphics.Clear(Color.FromArgb(24, 26, 34));
+
+        using (var sidebar = new SolidBrush(Color.FromArgb(38, 41, 53)))
+            graphics.FillRectangle(sidebar, new Rectangle(0, 0, 180, 600));
+
+        DrawBoard(
+            graphics,
+            left: 1200,
+            top: 80,
+            size: 400,
+            lightColor: Color.FromArgb(240, 217, 181),
+            darkColor: Color.FromArgb(181, 136, 99),
+            drawPieces: true,
+            drawCoordinates: false,
+            occludeCenter: false,
+            highlightCells: new[] { (3, 3), (4, 4) });
+        return bitmap;
     }
 
     private static Bitmap CreateOffsetScreen()
