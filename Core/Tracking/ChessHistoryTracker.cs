@@ -93,6 +93,7 @@ public sealed class ChessHistoryTracker
             if (IsReversibleKnightReturnToStart(changes, prevCount, currCount, out int plies, out bool includesBlackMove))
             {
                 _enPassant = "-";
+                _lastMoverIsWhite = !includesBlackMove;
                 if (_confidence == HistoryConfidence.Tracked)
                 {
                     _halfmoveClock += plies;
@@ -124,33 +125,39 @@ public sealed class ChessHistoryTracker
         // 3. Классификация перехода (1 полуход: обычный/взятие/превращение, en passant, рокировка)
         if (TryClassifySingleMove(changes, stableGrid, out bool isPawnMove, out bool isCapture, out bool blackMoved, out string epSquare))
         {
-            _enPassant = epSquare;
-            if (_confidence == HistoryConfidence.Tracked)
+            if (!HasSkippedHalfmove(!blackMoved))
             {
-                _halfmoveClock = (isPawnMove || isCapture) ? 0 : _halfmoveClock + 1;
-                if (blackMoved) _fullmoveNumber++;
+                _enPassant = epSquare;
+                if (_confidence == HistoryConfidence.Tracked)
+                {
+                    _halfmoveClock = (isPawnMove || isCapture) ? 0 : _halfmoveClock + 1;
+                    if (blackMoved) _fullmoveNumber++;
+                }
             }
-            NoteConfirmedMover(!blackMoved);
         }
         else if (TryClassifyEnPassantCapture(changes, _enPassant, out bool epBlackMoved))
         {
-            _enPassant = "-";
-            if (_confidence == HistoryConfidence.Tracked)
+            if (!HasSkippedHalfmove(!epBlackMoved))
             {
-                _halfmoveClock = 0;
-                if (epBlackMoved) _fullmoveNumber++;
+                _enPassant = "-";
+                if (_confidence == HistoryConfidence.Tracked)
+                {
+                    _halfmoveClock = 0;
+                    if (epBlackMoved) _fullmoveNumber++;
+                }
             }
-            NoteConfirmedMover(!epBlackMoved);
         }
         else if (TryClassifyCastling(changes, out bool castleBlackMoved))
         {
-            _enPassant = "-";
-            if (_confidence == HistoryConfidence.Tracked)
+            if (!HasSkippedHalfmove(!castleBlackMoved))
             {
-                _halfmoveClock++;
-                if (castleBlackMoved) _fullmoveNumber++;
+                _enPassant = "-";
+                if (_confidence == HistoryConfidence.Tracked)
+                {
+                    _halfmoveClock++;
+                    if (castleBlackMoved) _fullmoveNumber++;
+                }
             }
-            NoteConfirmedMover(!castleBlackMoved);
         }
         else
         {
@@ -232,18 +239,18 @@ public sealed class ChessHistoryTracker
         return true;
     }
 
-    private void NoteConfirmedMover(bool moverIsWhite)
+    private bool HasSkippedHalfmove(bool moverIsWhite)
     {
         if (_lastMoverIsWhite.HasValue && _lastMoverIsWhite.Value == moverIsWhite)
         {
             // Между подтверждёнными кадрами пропущен ответный полуход
             _confidence = HistoryConfidence.Unknown;
             _enPassant = "-";
+            _halfmoveClock = 0;
+            return true;
         }
-        else
-        {
-            _lastMoverIsWhite = moverIsWhite;
-        }
+        _lastMoverIsWhite = moverIsWhite;
+        return false;
     }
 
     private static bool TryClassifyEnPassantCapture(List<CellChange> changes, string enPassant, out bool blackMoved)

@@ -208,6 +208,8 @@ public class ChessHistoryTrackerTests
         ChessHistorySnapshot snapshot = tracker.Update(afterNf3);
         Assert.Equal(HistoryConfidence.Unknown, snapshot.Confidence);
         Assert.Equal("-", snapshot.EnPassantTarget);
+        Assert.Equal(0, snapshot.HalfmoveClock);
+        Assert.Equal(1, snapshot.FullmoveNumber);
     }
 
     [Fact]

@@ -1,3 +1,5 @@
+using ChGhost.Core.Tracking;
+
 namespace ChGhost.Core.Models;
 
 public sealed class TrackingUpdate
@@ -15,4 +17,5 @@ public sealed class TrackingUpdate
     public bool ShouldCalculateMove { get; init; }
     public int WhiteKings { get; init; }
     public int BlackKings { get; init; }
+    public HistoryConfidence Confidence { get; init; } = HistoryConfidence.Unknown;
 }

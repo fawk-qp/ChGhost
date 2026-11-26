@@ -96,7 +96,8 @@ public sealed class GameStateTracker
                 FullmoveNumber = history.FullmoveNumber,
                 IsUnchanged = true,
                 WhiteKings = whiteKings,
-                BlackKings = blackKings
+                BlackKings = blackKings,
+                Confidence = history.Confidence
             };
         }
 
@@ -136,7 +137,8 @@ public sealed class GameStateTracker
                     FullmoveNumber = history.FullmoveNumber,
                     IsWaitingForOpponent = true,
                     WhiteKings = whiteKings,
-                    BlackKings = blackKings
+                    BlackKings = blackKings,
+                    Confidence = history.Confidence
                 };
             }
 
@@ -155,7 +157,8 @@ public sealed class GameStateTracker
             FullmoveNumber = history.FullmoveNumber,
             ShouldCalculateMove = isMyTurn,
             WhiteKings = whiteKings,
-            BlackKings = blackKings
+            BlackKings = blackKings,
+            Confidence = history.Confidence
         };
     }
 
