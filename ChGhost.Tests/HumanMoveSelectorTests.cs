@@ -135,6 +135,25 @@ public class HumanMoveSelectorTests
         Assert.True(castling > rookShuffle, $"castling={castling}, rookShuffle={rookShuffle}");
     }
 
+    [Fact]
+    public void Select_ExtremeCpScores_DoesNotOverflowAndSkipsWorstCandidate()
+    {
+        var candidates = new[]
+        {
+            Cp("e2e4", int.MaxValue, 1),
+            Cp("d2d4", int.MaxValue - 1, 2),
+            Cp("a2a3", int.MinValue, 3)
+        };
+        var options = new HumanizerOptions(MaxCpLoss: 45, AdvisorMaxGapCp: 65, AdvisorMaxArrows: 2);
+
+        for (int i = 0; i < 30; i++)
+        {
+            MoveRecommendation rec = HumanMoveSelector.Select(candidates, EmptyGrid(), options, new Random(i));
+            Assert.NotEqual("a2a3", rec.Primary.Uci);
+            Assert.DoesNotContain(rec.Alternatives, c => c.Uci == "a2a3");
+        }
+    }
+
     private static CandidateMove Cp(string uci, int scoreCp, int multiPv)
         => new(uci, scoreCp, false, 0, 20, multiPv);
 

@@ -81,6 +81,16 @@ public class BoardPresenceCheckerTests
         Assert.False(BoardPresenceChecker.IsCheckerboardPresent(buffer, Stride));
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void TinyTileSize_ReturnsFalseWithoutThrowing(int tileSize)
+    {
+        var buffer = new byte[64];
+
+        Assert.False(BoardPresenceChecker.IsCheckerboardPresent(buffer, 64, tileSize));
+    }
+
     private static byte[] CreateBoard(bool highlighted, int width = Width, int height = Height, int tileSize = TileSize)
     {
         int stride = width * 3;

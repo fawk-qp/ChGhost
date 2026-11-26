@@ -62,6 +62,8 @@ public static class FenLegalityValidator
                     case 'b': bB++; break;
                     case 'N': wN++; break;
                     case 'n': bN++; break;
+                    default:
+                        return (false, $"Недопустимый символ клетки: '{p}'.");
                 }
             }
         }

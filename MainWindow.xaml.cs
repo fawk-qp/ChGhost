@@ -1327,7 +1327,7 @@ namespace ChGhost
                     bestMove = await _engine.GetBestMoveAsync(fullFen, moveTimeMs, scanToken);
                 }
                 sfStopwatch.Stop();
-                if (IsStale() || !_isRunning || scanToken.IsCancellationRequested)
+                if (IsStale() || (!_isRunning && !forceCalculate) || scanToken.IsCancellationRequested)
                     return;
 
                 if (useHumanizer)
@@ -1372,7 +1372,7 @@ namespace ChGhost
                                     _humanDelayCts = null;
                                 delayCts.Dispose();
                             }
-                            if (IsStale() || _activeFen != fullFen || !_isRunning || scanToken.IsCancellationRequested)
+                            if (IsStale() || _activeFen != fullFen || (!_isRunning && !forceCalculate) || scanToken.IsCancellationRequested)
                                 return;
                             appliedDelayMs = rec.RecommendedDelayMs;
                         }
@@ -1381,7 +1381,7 @@ namespace ChGhost
 
                 _logger.Info($"[MOVE] black={playAsBlackSnap} | inferMs={inferMs:F1} | dirty={dirtyCount} | sfMs={sfStopwatch.Elapsed.TotalMilliseconds:F1} | delayMs={appliedDelayMs} | pv={pvCount} | pick=#{pickIndex} | fen={fullFen} | best={bestMove}");
 
-                if (IsStale() || !_isRunning || scanToken.IsCancellationRequested)
+                if (IsStale() || (!_isRunning && !forceCalculate) || scanToken.IsCancellationRequested)
                     return;
 
                 if (bestMove.Length >= 4 && bestMove != "(none)")

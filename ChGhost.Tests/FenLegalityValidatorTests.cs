@@ -157,6 +157,19 @@ public class FenLegalityValidatorTests
         Assert.True(isLegal, reason);
     }
 
+    [Fact]
+    public void UnknownPieceSymbol_IsIllegal()
+    {
+        char[,] grid = EmptyGrid();
+        grid[0, 4] = 'k';
+        grid[7, 4] = 'K';
+        grid[3, 3] = 'X';
+
+        (bool isLegal, _) = FenLegalityValidator.Validate(grid, whiteToMove: true);
+
+        Assert.False(isLegal);
+    }
+
     private static char[,] EmptyGrid()
     {
         var grid = new char[8, 8];

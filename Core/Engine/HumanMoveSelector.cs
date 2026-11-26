@@ -37,7 +37,7 @@ public static class HumanMoveSelector
             return new MoveRecommendation(best, Array.Empty<CandidateMove>(), fastDelay, 0.05);
         }
 
-        int gapToSecond = best.EffectiveCp - ordered[1].EffectiveCp;
+        long gapToSecond = (long)best.EffectiveCp - ordered[1].EffectiveCp;
         bool isForcedTactic = gapToSecond >= options.ForcedTacticGapCp;
 
         // 2. Форсированная тактика (большой отрыв PV1 от PV2) — берём PV1
@@ -56,11 +56,11 @@ public static class HumanMoveSelector
 
         foreach (var cand in ordered)
         {
-            int loss = best.EffectiveCp - cand.EffectiveCp;
-            if (loss > maxLoss) continue;
+            long cpLoss = (long)best.EffectiveCp - cand.EffectiveCp;
+            if (cpLoss > maxLoss) continue;
 
             double humanBonus = EstimateHumanIntuitionBonus(cand.Uci, grid);
-            double score = -loss + humanBonus;
+            double score = -(double)cpLoss + humanBonus;
             double weight = Math.Exp(Math.Clamp(score / temperature, -12.0, 12.0));
 
             pool.Add((cand, weight));
@@ -90,7 +90,7 @@ public static class HumanMoveSelector
             foreach (var cand in ordered)
             {
                 if (cand.Uci.Equals(chosen.Uci, StringComparison.OrdinalIgnoreCase)) continue;
-                int gap = best.EffectiveCp - cand.EffectiveCp;
+                long gap = (long)best.EffectiveCp - cand.EffectiveCp;
                 if (gap <= options.AdvisorMaxGapCp)
                 {
                     alternatives.Add(cand);
@@ -178,7 +178,7 @@ public static class HumanMoveSelector
         int bestCp = ordered[0].EffectiveCp;
         for (int i = 1; i < ordered.Count; i++)
         {
-            if (bestCp - ordered[i].EffectiveCp <= 80)
+            if ((long)bestCp - ordered[i].EffectiveCp <= 80)
                 closeOptions++;
         }
 

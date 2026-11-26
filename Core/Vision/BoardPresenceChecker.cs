@@ -7,7 +7,7 @@ public static class BoardPresenceChecker
 
     public static bool IsCheckerboardPresent(ReadOnlySpan<byte> bgr24Buffer, int stride, int tileSize = 64)
     {
-        if (tileSize <= 0)
+        if (tileSize < 6)
             return false;
 
         int boardSize = tileSize * 8;
