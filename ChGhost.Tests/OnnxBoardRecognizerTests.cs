@@ -88,6 +88,48 @@ public class OnnxBoardRecognizerTests
         Assert.Null(detected);
     }
 
+    [Fact]
+    public void ValidateModelMetadata_RejectsNonFloatInputElementType()
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            OnnxBoardRecognizer.ValidateModelMetadata(
+                new[] { 1, 3, 64, 64 }, typeof(double), "input",
+                new[] { 1, 13 }, typeof(float), "output",
+                out _, out _));
+    }
+
+    [Fact]
+    public void ValidateModelMetadata_RejectsNonFloatOutputElementType()
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            OnnxBoardRecognizer.ValidateModelMetadata(
+                new[] { 1, 3, 64, 64 }, typeof(float), "input",
+                new[] { 1, 13 }, typeof(double), "output",
+                out _, out _));
+    }
+
+    [Fact]
+    public void ValidateModelMetadata_RejectsFixedOutputBatchGreaterThanOne()
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            OnnxBoardRecognizer.ValidateModelMetadata(
+                new[] { -1, 3, 64, 64 }, typeof(float), "input",
+                new[] { 4, 13 }, typeof(float), "output",
+                out _, out _));
+    }
+
+    [Fact]
+    public void ValidateModelMetadata_OutputBatchOneForcesFixedBatchOne()
+    {
+        OnnxBoardRecognizer.ValidateModelMetadata(
+            new[] { -1, 3, 48, 48 }, typeof(float), "input",
+            new[] { 1, 13 }, typeof(float), "output",
+            out int tileSize, out bool fixedBatchOne);
+
+        Assert.Equal(48, tileSize);
+        Assert.True(fixedBatchOne);
+    }
+
     private static char[,] CreateGridFromRows(params string[] rows)
     {
         Assert.Equal(8, rows.Length);

@@ -194,6 +194,7 @@ namespace ChGhost
             RegisterHotKeys(hwnd);
 
             HwndSource.FromHwnd(hwnd)?.AddHook(WndProc);
+            ApplyOverlayMonitorForBoard();
             UpdateUI();
         }
 
@@ -235,12 +236,7 @@ namespace ChGhost
             {
                 Dispatcher.BeginInvoke(() =>
                 {
-                    if (HasValidBoardBounds())
-                    {
-                        BoardRect? b = _boardDetector.Detect();
-                        if (b.HasValue)
-                            ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(b.Value.Left, b.Value.Top, b.Value.Width, b.Value.Height));
-                    }
+                    ApplyOverlayMonitorForBoard();
                     RedrawOverlay();
                 });
                 return IntPtr.Zero;
@@ -350,6 +346,7 @@ namespace ChGhost
                         break;
 
                     case 10:
+                        InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
                         ResetBoardTracking();
                         RedrawOverlay();
                         _ = RunScanAndSuggestAsync(forceCalculate: true);
@@ -413,6 +410,7 @@ namespace ChGhost
             ResetBoardTracking();
             ClearGraphics();
             LoadConfig();
+            ApplyOverlayMonitorForBoard();
 
             if (HasValidBoardBounds() && HasValidSignatures())
             {
@@ -478,6 +476,7 @@ namespace ChGhost
                 }
             }
 
+            InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
             ResetBoardTracking();
             DrawCalibrationGrid();
 
@@ -495,7 +494,16 @@ namespace ChGhost
             _isAutoDetecting = true;
             try
             {
+                long versionSnap = Interlocked.Read(ref _stateVersion);
+                int profileSnap = _activeProfile;
                 BoardDetectionDiagnostics diag = await Task.Run(() => _autoBoardDetector.DetectWithDiagnostics());
+                if (versionSnap != Interlocked.Read(ref _stateVersion)
+                    || profileSnap != _activeProfile
+                    || _shutdownStarted)
+                {
+                    _logger.Info("Auto board detection result discarded: application state changed during scan.");
+                    return;
+                }
                 if (diag.Rect is not { } rect)
                 {
                     _logger.Warn("Auto board detection did not find a chessboard.");
@@ -525,6 +533,7 @@ namespace ChGhost
                     }
                 }
 
+                InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
                 ResetBoardTracking();
                 DrawCalibrationGrid();
                 _logger.Info($"[AUTODETECT] Board found: {rect.Left},{rect.Top} -> {rect.Right},{rect.Bottom} ({rect.Width}x{rect.Height}) | corners={diag.MatchedCorners}/49 | parity={diag.ParitySquares}/64 | ms={diag.ElapsedMs:F1}");
@@ -559,6 +568,7 @@ namespace ChGhost
 
             if (CalibratableRecognizer == null)
             {
+                InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
                 if (_recognizer is OnnxBoardRecognizer onnxRecognizer)
                     TryDetectOnnxPlayAsBlack(onnxRecognizer);
 
@@ -585,6 +595,7 @@ namespace ChGhost
             {
                 _playAsBlack = calibration.PlayAsBlack;
                 SaveConfig();
+                InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
                 ResetBoardTracking();
                 ClearGraphics();
 
@@ -606,6 +617,7 @@ namespace ChGhost
                 return;
             }
 
+            InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
             ResetBoardTracking();
             ClearGraphics();
 
@@ -1012,6 +1024,7 @@ namespace ChGhost
             _isRunning = !_isRunning;
             if (_isRunning)
             {
+                InvalidateScanState();
                 ResetBoardTracking();
                 ClearGraphics();
                 _scanTimer.Start();
@@ -1019,6 +1032,7 @@ namespace ChGhost
             }
             else
             {
+                InvalidateScanState();
                 _scanTimer.Stop();
                 CancelHumanDelay();
                 ClearGraphics();
@@ -1072,6 +1086,15 @@ namespace ChGhost
             System.Windows.Point topLeft = ScreenToOverlayDip(_topLeft);
             System.Windows.Point bottomRight = ScreenToOverlayDip(_bottomRight);
             return new System.Windows.Rect(topLeft, bottomRight);
+        }
+
+        private void ApplyOverlayMonitorForBoard()
+        {
+            if (!HasValidBoardBounds())
+                return;
+            BoardRect? bounds = _boardDetector.Detect();
+            if (bounds.HasValue)
+                ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(bounds.Value.Left, bounds.Value.Top, bounds.Value.Width, bounds.Value.Height));
         }
 
         private void ApplyOverlayMonitorBounds(System.Drawing.Rectangle boardRect)
@@ -1264,7 +1287,10 @@ namespace ChGhost
                 }
 
                 char turn = playAsBlackSnap ? 'b' : 'w';
-                string fullFen = $"{tracking.StableFen} {turn} {tracking.CastlingRights} {tracking.EnPassantTarget} {tracking.HalfmoveClock} {tracking.FullmoveNumber}";
+                string epTarget = tracking.EnPassantTarget;
+                bool epMatchesTurn = epTarget != "-" && epTarget.Length == 2
+                    && ((turn == 'w' && epTarget[1] == '6') || (turn == 'b' && epTarget[1] == '3'));
+                string fullFen = $"{tracking.StableFen} {turn} {tracking.CastlingRights} {(epMatchesTurn ? epTarget : "-")} {tracking.HalfmoveClock} {tracking.FullmoveNumber}";
                 _activeFen = fullFen;
                 int moveTimeMs = _isBlitzTurboMode ? _settings.MoveTimeBlitzMs : _settings.MoveTimeRapidMs;
 
@@ -1301,6 +1327,8 @@ namespace ChGhost
                     bestMove = await _engine.GetBestMoveAsync(fullFen, moveTimeMs, scanToken);
                 }
                 sfStopwatch.Stop();
+                if (IsStale() || !_isRunning || scanToken.IsCancellationRequested)
+                    return;
 
                 if (useHumanizer)
                 {
@@ -1344,7 +1372,7 @@ namespace ChGhost
                                     _humanDelayCts = null;
                                 delayCts.Dispose();
                             }
-                            if (_activeFen != fullFen || !_isRunning)
+                            if (IsStale() || _activeFen != fullFen || !_isRunning || scanToken.IsCancellationRequested)
                                 return;
                             appliedDelayMs = rec.RecommendedDelayMs;
                         }
@@ -1352,6 +1380,9 @@ namespace ChGhost
                 }
 
                 _logger.Info($"[MOVE] black={playAsBlackSnap} | inferMs={inferMs:F1} | dirty={dirtyCount} | sfMs={sfStopwatch.Elapsed.TotalMilliseconds:F1} | delayMs={appliedDelayMs} | pv={pvCount} | pick=#{pickIndex} | fen={fullFen} | best={bestMove}");
+
+                if (IsStale() || !_isRunning || scanToken.IsCancellationRequested)
+                    return;
 
                 if (bestMove.Length >= 4 && bestMove != "(none)")
                 {
@@ -1661,13 +1692,23 @@ namespace ChGhost
             try
             {
                 var scanTask = _activeScanTask;
+                bool scanCompleted = scanTask is null;
                 if (scanTask is not null)
                 {
-                    try { await Task.WhenAny(scanTask, Task.Delay(1500)); } catch { }
+                    try
+                    {
+                        scanCompleted = await Task.WhenAny(scanTask, Task.Delay(1500)) == scanTask;
+                    }
+                    catch
+                    {
+                        scanCompleted = false;
+                    }
                 }
+                if (!scanCompleted)
+                    _logger.Warn("Active board scan did not finish within the shutdown timeout; shared capture resources are left for the OS to reclaim on exit.");
 
-                try { _captureBitmap?.Dispose(); _captureBitmap = null; } catch { }
-                try { (_recognizer as IDisposable)?.Dispose(); } catch { }
+                try { if (scanCompleted) { _captureBitmap?.Dispose(); _captureBitmap = null; } } catch { }
+                try { if (scanCompleted) (_recognizer as IDisposable)?.Dispose(); } catch { }
                 try
                 {
                     if (_engine is IAsyncDisposable asyncEng)

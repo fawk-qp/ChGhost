@@ -44,6 +44,7 @@ public sealed class ChessHistoryTracker
     private int _halfmoveClock;
     private int _fullmoveNumber = 1;
     private HistoryConfidence _confidence = HistoryConfidence.Tracked;
+    private bool? _lastMoverIsWhite;
 
     public void Reset()
     {
@@ -53,6 +54,7 @@ public sealed class ChessHistoryTracker
         _halfmoveClock = 0;
         _fullmoveNumber = 1;
         _confidence = HistoryConfidence.Tracked;
+        _lastMoverIsWhite = null;
     }
 
     public ChessHistorySnapshot Update(char[,] stableGrid)
@@ -71,6 +73,7 @@ public sealed class ChessHistoryTracker
             _confidence = IsStartingPosition(stableGrid)
                 ? HistoryConfidence.Tracked
                 : HistoryConfidence.Unknown;
+            _lastMoverIsWhite = null;
             return BuildSnapshot();
         }
 
@@ -103,6 +106,7 @@ public sealed class ChessHistoryTracker
                 _halfmoveClock = 0;
                 _fullmoveNumber = 1;
                 _confidence = HistoryConfidence.Tracked;
+                _lastMoverIsWhite = null;
             }
 
             _prevGrid = CloneGrid(stableGrid);
@@ -126,8 +130,9 @@ public sealed class ChessHistoryTracker
                 _halfmoveClock = (isPawnMove || isCapture) ? 0 : _halfmoveClock + 1;
                 if (blackMoved) _fullmoveNumber++;
             }
+            NoteConfirmedMover(!blackMoved);
         }
-        else if (TryClassifyEnPassantCapture(changes, out bool epBlackMoved))
+        else if (TryClassifyEnPassantCapture(changes, _enPassant, out bool epBlackMoved))
         {
             _enPassant = "-";
             if (_confidence == HistoryConfidence.Tracked)
@@ -135,6 +140,7 @@ public sealed class ChessHistoryTracker
                 _halfmoveClock = 0;
                 if (epBlackMoved) _fullmoveNumber++;
             }
+            NoteConfirmedMover(!epBlackMoved);
         }
         else if (TryClassifyCastling(changes, out bool castleBlackMoved))
         {
@@ -144,6 +150,7 @@ public sealed class ChessHistoryTracker
                 _halfmoveClock++;
                 if (castleBlackMoved) _fullmoveNumber++;
             }
+            NoteConfirmedMover(!castleBlackMoved);
         }
         else
         {
@@ -151,6 +158,7 @@ public sealed class ChessHistoryTracker
             _enPassant = "-";
             _halfmoveClock = 0;
             _confidence = HistoryConfidence.Unknown;
+            _lastMoverIsWhite = null;
         }
 
         _prevGrid = CloneGrid(stableGrid);
@@ -224,10 +232,24 @@ public sealed class ChessHistoryTracker
         return true;
     }
 
-    private static bool TryClassifyEnPassantCapture(List<CellChange> changes, out bool blackMoved)
+    private void NoteConfirmedMover(bool moverIsWhite)
+    {
+        if (_lastMoverIsWhite.HasValue && _lastMoverIsWhite.Value == moverIsWhite)
+        {
+            // Между подтверждёнными кадрами пропущен ответный полуход
+            _confidence = HistoryConfidence.Unknown;
+            _enPassant = "-";
+        }
+        else
+        {
+            _lastMoverIsWhite = moverIsWhite;
+        }
+    }
+
+    private static bool TryClassifyEnPassantCapture(List<CellChange> changes, string enPassant, out bool blackMoved)
     {
         blackMoved = false;
-        if (changes.Count != 3) return false;
+        if (changes.Count != 3 || enPassant == "-") return false;
 
         // Ровно 1 клетка получила пешку из пустоты, 2 клетки опустели (своя пешка + взятая вражеская)
         int arrivedIdx = -1;
@@ -242,6 +264,8 @@ public sealed class ChessHistoryTracker
         if (arrivedIdx < 0) return false;
 
         var dest = changes[arrivedIdx];
+        if (!string.Equals(ToAlgebraic(dest.R, dest.C), enPassant, StringComparison.Ordinal))
+            return false;
         bool isWhite = dest.After == 'P';
         char enemyPawn = isWhite ? 'p' : 'P';
         int expectedFromR = isWhite ? dest.R + 1 : dest.R - 1;

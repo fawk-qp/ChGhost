@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <Compile Remove="ChGhost.Tests/**/*.cs" />
+    <InternalsVisibleTo Include="ChGhost.Tests" />
     <None Update="stockfish.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

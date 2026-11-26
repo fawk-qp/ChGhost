@@ -50,13 +50,13 @@ public static class Win32Interop
     public static bool TrySetWindowLong(IntPtr window, int index, int value, out int errorCode)
     {
         Marshal.SetLastPInvokeError(0);
-        IntPtr previous = NativeMethods.SetWindowLongPtr(window, index, new IntPtr(value));
+        IntPtr previous = SetWindowLongPtr(window, index, new IntPtr(value));
         errorCode = previous == IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
         return errorCode == 0;
     }
 
     public static int GetWindowLong(IntPtr window, int index) =>
-        NativeMethods.GetWindowLongPtr(window, index).ToInt32();
+        GetWindowLongPtr(window, index).ToInt32();
 
     public static bool TryRegisterHotKey(IntPtr window, int id, uint modifiers, uint key, out int errorCode)
     {

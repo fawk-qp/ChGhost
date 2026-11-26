@@ -66,15 +66,23 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         };
 
         _session = new InferenceSession(modelPath, sessionOptions);
-        _inputName = _session.InputMetadata.Keys.First();
-        _outputName = _session.OutputMetadata.Keys.First();
-        ValidateModelMetadata(_session, _inputName, _outputName, out _tileSize, out _fixedBatchOne);
-        _boardRenderSize = _tileSize * 8;
-        _planeLength = _tileSize * _tileSize;
-        _sampleFloatLength = 3 * _planeLength;
-        _tensorBuffer = new float[64 * _sampleFloatLength];
+        try
+        {
+            _inputName = _session.InputMetadata.Keys.First();
+            _outputName = _session.OutputMetadata.Keys.First();
+            ValidateModelMetadata(_session, _inputName, _outputName, out _tileSize, out _fixedBatchOne);
+            _boardRenderSize = _tileSize * 8;
+            _planeLength = _tileSize * _tileSize;
+            _sampleFloatLength = 3 * _planeLength;
+            _tensorBuffer = new float[64 * _sampleFloatLength];
 
-        logger?.Info($"ONNX-распознаватель загружен: {modelPath} (input={_inputName}, output={_outputName}, tile={_tileSize}x{_tileSize}).");
+            logger?.Info($"ONNX-распознаватель загружен: {modelPath} (input={_inputName}, output={_outputName}, tile={_tileSize}x{_tileSize}).");
+        }
+        catch
+        {
+            _session.Dispose();
+            throw;
+        }
     }
 
     public string EngineName => "OnnxBoardRecognizer";
@@ -501,7 +509,29 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         out int tileSize,
         out bool fixedBatchOne)
     {
-        var inDims = session.InputMetadata[inputName].Dimensions;
+        NodeMetadata inputMeta = session.InputMetadata[inputName];
+        NodeMetadata outputMeta = session.OutputMetadata[outputName];
+        ValidateModelMetadata(
+            inputMeta.Dimensions, inputMeta.ElementType, inputName,
+            outputMeta.Dimensions, outputMeta.ElementType, outputName,
+            out tileSize, out fixedBatchOne);
+    }
+
+    internal static void ValidateModelMetadata(
+        int[] inDims,
+        Type inElementType,
+        string inputName,
+        int[] outDims,
+        Type outElementType,
+        string outputName,
+        out int tileSize,
+        out bool fixedBatchOne)
+    {
+        if (inElementType != typeof(float))
+            throw new InvalidOperationException($"ONNX input '{inputName}' must use float32 elements, got {inElementType}.");
+        if (outElementType != typeof(float))
+            throw new InvalidOperationException($"ONNX output '{outputName}' must use float32 elements, got {outElementType}.");
+
         if (inDims.Length != 4)
             throw new InvalidOperationException($"ONNX input '{inputName}' must have rank 4 (NCHW), got {inDims.Length}.");
 
@@ -518,9 +548,13 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         else
             throw new InvalidOperationException($"ONNX input '{inputName}' has unsupported fixed batch dimension: {inDims[0]}.");
 
-        var outDims = session.OutputMetadata[outputName].Dimensions;
         if (outDims.Length != 2 || outDims[1] != 13)
             throw new InvalidOperationException($"ONNX output '{outputName}' must have shape [B, 13], got [{string.Join(", ", outDims)}].");
+
+        if (outDims[0] == 1)
+            fixedBatchOne = true;
+        else if (outDims[0] > 1)
+            throw new InvalidOperationException($"ONNX output '{outputName}' has unsupported fixed batch dimension: {outDims[0]}.");
 
         tileSize = inDims[2];
     }

@@ -136,6 +136,128 @@ public class ChessHistoryTrackerTests
         Assert.Equal(HistoryConfidence.Unknown, snapshot.Confidence);
     }
 
+    [Fact]
+    public void RealEnPassantCaptureAfterDoublePushStaysTracked()
+    {
+        var tracker = new ChessHistoryTracker();
+        char[,] start = StartGrid();
+        tracker.Update(start);
+
+        char[,] afterE4 = Move(start, 6, 4, 4, 4);
+        tracker.Update(afterE4);
+
+        char[,] afterNf6 = Move(afterE4, 0, 6, 2, 5);
+        tracker.Update(afterNf6);
+
+        char[,] afterE5 = Move(afterNf6, 4, 4, 3, 4);
+        tracker.Update(afterE5);
+
+        char[,] afterD5 = Move(afterE5, 1, 3, 3, 3);
+        ChessHistorySnapshot doublePush = tracker.Update(afterD5);
+        Assert.Equal("d6", doublePush.EnPassantTarget);
+
+        char[,] afterExd6 = EnPassantCapture(afterD5, 3, 4, 2, 3, 3, 3);
+        ChessHistorySnapshot capture = tracker.Update(afterExd6);
+        Assert.Equal(HistoryConfidence.Tracked, capture.Confidence);
+        Assert.Equal("-", capture.EnPassantTarget);
+        Assert.Equal(0, capture.HalfmoveClock);
+        Assert.Equal(3, capture.FullmoveNumber);
+    }
+
+    [Fact]
+    public void EnPassantPatternWithoutEnPassantTargetMarksUnknown()
+    {
+        var tracker = new ChessHistoryTracker();
+        char[,] start = StartGrid();
+        tracker.Update(start);
+
+        char[,] afterE4 = Move(start, 6, 4, 4, 4);
+        tracker.Update(afterE4);
+
+        char[,] afterNf6 = Move(afterE4, 0, 6, 2, 5);
+        tracker.Update(afterNf6);
+
+        char[,] afterE5 = Move(afterNf6, 4, 4, 3, 4);
+        tracker.Update(afterE5);
+
+        char[,] afterD5 = Move(afterE5, 1, 3, 3, 3);
+        tracker.Update(afterD5);
+
+        char[,] afterNf3 = Move(afterD5, 7, 6, 5, 5);
+        ChessHistorySnapshot quiet = tracker.Update(afterNf3);
+        Assert.Equal("-", quiet.EnPassantTarget);
+
+        char[,] fakeEnPassant = EnPassantCapture(afterNf3, 3, 4, 2, 3, 3, 3);
+        ChessHistorySnapshot snapshot = tracker.Update(fakeEnPassant);
+        Assert.Equal(HistoryConfidence.Unknown, snapshot.Confidence);
+        Assert.Equal("-", snapshot.EnPassantTarget);
+    }
+
+    [Fact]
+    public void TwoMovesBySameSideMarkHistoryUnknownAndClearEnPassant()
+    {
+        var tracker = new ChessHistoryTracker();
+        char[,] start = StartGrid();
+        tracker.Update(start);
+
+        char[,] afterE4 = Move(start, 6, 4, 4, 4);
+        ChessHistorySnapshot push = tracker.Update(afterE4);
+        Assert.Equal("e3", push.EnPassantTarget);
+
+        char[,] afterNf3 = Move(afterE4, 7, 6, 5, 5);
+        ChessHistorySnapshot snapshot = tracker.Update(afterNf3);
+        Assert.Equal(HistoryConfidence.Unknown, snapshot.Confidence);
+        Assert.Equal("-", snapshot.EnPassantTarget);
+    }
+
+    [Fact]
+    public void CastlingIsTrackedAsSingleHalfmove()
+    {
+        var tracker = new ChessHistoryTracker();
+        char[,] g = StartGrid();
+        tracker.Update(g);
+
+        g = Move(g, 6, 4, 4, 4); tracker.Update(g);   // 1. e4
+        g = Move(g, 1, 4, 3, 4); tracker.Update(g);   // 1... e5
+        g = Move(g, 7, 6, 5, 5); tracker.Update(g);   // 2. Nf3
+        g = Move(g, 0, 1, 2, 2); tracker.Update(g);   // 2... Nc6
+        g = Move(g, 7, 5, 4, 2); tracker.Update(g);   // 3. Bc4
+        g = Move(g, 0, 5, 3, 2); tracker.Update(g);   // 3... Bc5
+        g = Move(Move(g, 7, 4, 7, 6), 7, 7, 7, 5);   // 4. O-O
+        ChessHistorySnapshot castle = tracker.Update(g);
+        Assert.Equal(HistoryConfidence.Tracked, castle.Confidence);
+        Assert.Equal("-", castle.EnPassantTarget);
+        Assert.Equal("kq", castle.CastlingFen);
+        Assert.Equal(5, castle.HalfmoveClock);
+        Assert.Equal(4, castle.FullmoveNumber);
+    }
+
+    [Fact]
+    public void PawnPromotionIsTrackedAsSingleHalfmove()
+    {
+        var tracker = new ChessHistoryTracker();
+        char[,] g = StartGrid();
+        tracker.Update(g);
+
+        g = Move(g, 7, 1, 5, 2); tracker.Update(g);   // Nb1-c3
+        g = Move(g, 1, 0, 3, 0);                      // a7-a5
+        ChessHistorySnapshot doublePush = tracker.Update(g);
+        Assert.Equal("a6", doublePush.EnPassantTarget);
+        g = Move(g, 5, 2, 4, 4); tracker.Update(g);   // Nc3-e4
+        g = Move(g, 3, 0, 4, 0); tracker.Update(g);   // a5-a4
+        g = Move(g, 4, 4, 5, 2); tracker.Update(g);   // Ne4-c3
+        g = Move(g, 4, 0, 5, 0); tracker.Update(g);   // a4-a3
+        g = Move(g, 5, 2, 4, 4); tracker.Update(g);   // Nc3-e4
+        g = Move(g, 5, 0, 6, 1); tracker.Update(g);   // axb2
+        g = Move(g, 4, 4, 5, 2); tracker.Update(g);   // Ne4-c3
+        g = Promote(g, 6, 1, 7, 1, 'q');              // b2-b1=q
+        ChessHistorySnapshot promo = tracker.Update(g);
+        Assert.Equal(HistoryConfidence.Tracked, promo.Confidence);
+        Assert.Equal("-", promo.EnPassantTarget);
+        Assert.Equal(0, promo.HalfmoveClock);
+        Assert.Equal(6, promo.FullmoveNumber);
+    }
+
     private static char[,] CastlingGrid() => Grid(
         (7, 4, 'K'), (7, 0, 'R'), (7, 7, 'R'),
         (0, 4, 'k'), (0, 0, 'r'), (0, 7, 'r'));
@@ -181,6 +303,24 @@ public class ChessHistoryTrackerTests
     {
         char[,] copy = (char[,])grid.Clone();
         char piece = copy[fromRow, fromCol];
+        copy[fromRow, fromCol] = '1';
+        copy[toRow, toCol] = piece;
+        return copy;
+    }
+
+    private static char[,] EnPassantCapture(char[,] grid, int fromRow, int fromCol, int toRow, int toCol, int capturedRow, int capturedCol)
+    {
+        char[,] copy = (char[,])grid.Clone();
+        char piece = copy[fromRow, fromCol];
+        copy[fromRow, fromCol] = '1';
+        copy[toRow, toCol] = piece;
+        copy[capturedRow, capturedCol] = '1';
+        return copy;
+    }
+
+    private static char[,] Promote(char[,] grid, int fromRow, int fromCol, int toRow, int toCol, char piece)
+    {
+        char[,] copy = (char[,])grid.Clone();
         copy[fromRow, fromCol] = '1';
         copy[toRow, toCol] = piece;
         return copy;
