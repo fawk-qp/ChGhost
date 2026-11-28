@@ -130,6 +130,30 @@ public class OnnxBoardRecognizerTests
         Assert.True(fixedBatchOne);
     }
 
+    [Theory]
+    [InlineData(257)]
+    [InlineData(512)]
+    public void ValidateModelMetadata_RejectsTileSizeGreaterThan256(int tileSize)
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            OnnxBoardRecognizer.ValidateModelMetadata(
+                new[] { -1, 3, tileSize, tileSize }, typeof(float), "input",
+                new[] { -1, 13 }, typeof(float), "output",
+                out _, out _));
+    }
+
+    [Fact]
+    public void ValidateModelMetadata_AcceptsTileSize256()
+    {
+        OnnxBoardRecognizer.ValidateModelMetadata(
+            new[] { -1, 3, 256, 256 }, typeof(float), "input",
+            new[] { -1, 13 }, typeof(float), "output",
+            out int tileSize, out bool fixedBatchOne);
+
+        Assert.Equal(256, tileSize);
+        Assert.False(fixedBatchOne);
+    }
+
     private static char[,] CreateGridFromRows(params string[] rows)
     {
         Assert.Equal(8, rows.Length);

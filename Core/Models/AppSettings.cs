@@ -94,7 +94,7 @@ public sealed class AppSettings
             : EngineExecutablePath.Trim();
         EngineIdleUnloadSeconds = Math.Clamp(EngineIdleUnloadSeconds, 0, 86_400);
         MultiPvCount = Math.Clamp(MultiPvCount, 1, 6);
-        HumanMaxCpLoss = Math.Clamp(HumanMaxCpLoss, 0, 2_000);
+        HumanMaxCpLoss = Math.Clamp(HumanMaxCpLoss, 0, 300);
         HumanTemperature = Math.Clamp(HumanTemperature, 8.0, 256.0);
         AdvisorMaxGapCp = Math.Clamp(AdvisorMaxGapCp, 0, 2_000);
         AdvisorArrowOpacity = Math.Clamp(AdvisorArrowOpacity, 0.2, 1.0);

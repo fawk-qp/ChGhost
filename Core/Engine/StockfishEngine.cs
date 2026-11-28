@@ -78,7 +78,7 @@ public sealed class StockfishEngine : IChessEngine
 
     public async Task<string> GetBestMoveAsync(string fen, int moveTimeMs, CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(fen);
+        ValidateFen(fen);
         await _commandLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -104,7 +104,7 @@ public sealed class StockfishEngine : IChessEngine
         int multiPv,
         CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(fen);
+        ValidateFen(fen);
         await _commandLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -290,6 +290,7 @@ public sealed class StockfishEngine : IChessEngine
             _currentMultiPv = targetMultiPv;
         }
 
+        ValidateFen(fen);
         await WriteCommandAsync($"position fen {fen}", cancellationToken).ConfigureAwait(false);
 
         var pvCandidates = new Dictionary<int, CandidateMove>();
@@ -473,6 +474,17 @@ public sealed class StockfishEngine : IChessEngine
         while (reader.TryRead(out _))
         {
         }
+    }
+
+    internal static void ValidateFen(string fen)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(fen);
+        if (fen.IndexOfAny(['\r', '\n', '\0']) >= 0)
+            throw new ArgumentException("FEN must not contain newline or NUL characters.", nameof(fen));
+
+        string[] fields = fen.Split(' ');
+        if (fields.Length != 6 || fields.Any(string.IsNullOrWhiteSpace))
+            throw new ArgumentException("FEN must contain exactly 6 non-empty space-separated fields.", nameof(fen));
     }
 
     private static bool IsValidUciMove(string move)

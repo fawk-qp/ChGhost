@@ -47,6 +47,8 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
     private Bitmap? _resizedBitmap;
     private int _prevStride;
     private bool _hasCache;
+    private BoardRecognitionResult? _cachedResult;
+    private bool _cachedPlayAsBlack;
     private int _ticksSinceFullRefresh;
     private bool _disposed;
 
@@ -71,10 +73,13 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             _inputName = _session.InputMetadata.Keys.First();
             _outputName = _session.OutputMetadata.Keys.First();
             ValidateModelMetadata(_session, _inputName, _outputName, out _tileSize, out _fixedBatchOne);
-            _boardRenderSize = _tileSize * 8;
-            _planeLength = _tileSize * _tileSize;
-            _sampleFloatLength = 3 * _planeLength;
-            _tensorBuffer = new float[64 * _sampleFloatLength];
+            checked
+            {
+                _boardRenderSize = _tileSize * 8;
+                _planeLength = _tileSize * _tileSize;
+                _sampleFloatLength = 3 * _planeLength;
+                _tensorBuffer = new float[64 * _sampleFloatLength];
+            }
 
             logger?.Info($"ONNX-распознаватель загружен: {modelPath} (input={_inputName}, output={_outputName}, tile={_tileSize}x{_tileSize}).");
         }
@@ -97,6 +102,7 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         lock (_inferLock)
         {
             _hasCache = false;
+            _cachedResult = null;
             _ticksSinceFullRefresh = 0;
         }
     }
@@ -109,7 +115,13 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (!_hasCache)
                 return CreateEmptyResult();
-            return BuildResultFromCache(playAsBlack);
+            if (_cachedResult is not null && _cachedPlayAsBlack == playAsBlack)
+                return _cachedResult;
+
+            BoardRecognitionResult result = BuildResultFromCache(playAsBlack);
+            _cachedResult = result;
+            _cachedPlayAsBlack = playAsBlack;
+            return result;
         }
     }
 
@@ -243,6 +255,7 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
                 sw.Stop();
                 LastInferenceMs = sw.Elapsed.TotalMilliseconds;
                 _hasCache = false;
+                _cachedResult = null;
                 return CreateEmptyResult();
             }
 
@@ -320,7 +333,13 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             sw.Stop();
             LastInferenceMs = sw.Elapsed.TotalMilliseconds;
 
-            return BuildResultFromCache(playAsBlack);
+            if (dirtyCount == 0 && _cachedResult is not null && _cachedPlayAsBlack == playAsBlack)
+                return _cachedResult;
+
+            BoardRecognitionResult result = BuildResultFromCache(playAsBlack);
+            _cachedResult = result;
+            _cachedPlayAsBlack = playAsBlack;
+            return result;
         }
     }
 
@@ -540,6 +559,8 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
 
         if (inDims[2] <= 0 || inDims[2] != inDims[3])
             throw new InvalidOperationException($"ONNX input '{inputName}' must have positive square spatial dims, got {inDims[2]}x{inDims[3]}.");
+        if (inDims[2] > 256)
+            throw new InvalidOperationException($"ONNX input '{inputName}' spatial size {inDims[2]} exceeds maximum supported tile size 256.");
 
         if (inDims[0] <= 0)
             fixedBatchOne = false;
@@ -609,6 +630,8 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         {
             if (_disposed) return;
             _disposed = true;
+            _hasCache = false;
+            _cachedResult = null;
             _resizedBitmap?.Dispose();
             _resizedBitmap = null;
             _session.Dispose();

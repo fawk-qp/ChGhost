@@ -46,10 +46,10 @@ namespace ChGhost
 
         private readonly (char fen, string name)[] _manualFixOrder =
         {
-            ('P', "Белая ПЕШКА"), ('N', "Белый КОНЬ"), ('B', "Белый СЛОН"),
-            ('R', "Белая ЛАДЬЯ"), ('Q', "Белый ФЕРЗЬ"), ('K', "Белый КОРОЛЬ"),
-            ('p', "Чёрная ПЕШКА"), ('n', "Чёрный КОНЬ"), ('b', "Чёрный СЛОН"),
-            ('r', "Чёрная ЛАДЬЯ"), ('q', "Чёрный ФЕРЗЬ"), ('k', "Чёрный КОРОЛЬ")
+            ('P', "Белая пешка"), ('N', "Белый конь"), ('B', "Белый слон"),
+            ('R', "Белая ладья"), ('Q', "Белый ферзь"), ('K', "Белый король"),
+            ('p', "Чёрная пешка"), ('n', "Чёрный конь"), ('b', "Чёрный слон"),
+            ('r', "Чёрная ладья"), ('q', "Чёрный ферзь"), ('k', "Чёрный король")
         };
         private int _fixIndex = 0;
 
@@ -68,7 +68,7 @@ namespace ChGhost
         private bool _isRunning = false;
         private bool _playAsBlack = false;
         private bool _isHidden = false;
-        private bool _showDebugOverlay = true;
+        private bool _showDebugOverlay = false;
         private bool _isBlitzTurboMode = true;
         private string _startupWarning = "";
         private readonly HashSet<int> _registeredHotkeys = new();
@@ -90,6 +90,8 @@ namespace ChGhost
         private bool _lastBoardVisible = true;
         private string _lastIllegalFen = "";
         private string? _activeFen = null;
+        private string? _lastStableFullFen = null;
+        private string? _lastRenderedStateKey = null;
 
         private char[,]? _currentGrid = null;
         private bool _isScanning = false;
@@ -206,7 +208,8 @@ namespace ChGhost
                 (4, 0x34, "Alt+4"), (5, 0x35, "Alt+5"), (6, 0x53, "Alt+S"),
                 (7, 0x43, "Alt+C"), (8, 0x48, "Alt+H"), (9, 0x51, "Alt+Q"),
                 (10, 0x52, "Alt+R"), (11, 0x44, "Alt+D"), (12, 0x46, "Alt+F"),
-                (13, 0x47, "Alt+G"), (14, 0x42, "Alt+B"), (15, 0x45, "Alt+E"), (16, 0x50, "Alt+P")
+                (13, 0x47, "Alt+G"), (14, 0x42, "Alt+B"), (15, 0x45, "Alt+E"),
+                (16, 0x50, "Alt+P"), (17, 0x54, "Alt+T")
             };
             var failed = new List<string>();
             foreach (var hotkey in hotkeys)
@@ -266,7 +269,8 @@ namespace ChGhost
                         ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(cursor.X, cursor.Y, 1, 1));
                         DrawCalibrationGrid();
                         InvalidateOnnxCache();
-                        UpdateUI($"[П{_activeProfile}] Угол A8 задан ({_topLeft.X}, {_topLeft.Y}) -> теперь Alt+2 на H1");
+                        _logger.Info($"[П{_activeProfile}] Угол A8 задан ({_topLeft.X}, {_topLeft.Y})");
+                        UpdateUI("Верхний угол задан. Наведите на нижний угол и нажмите Alt+2.");
                         InvalidateScanState(requestRescan: _isRunning);
                         break;
 
@@ -278,23 +282,24 @@ namespace ChGhost
                             ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(bounds.Value.Left, bounds.Value.Top, bounds.Value.Width, bounds.Value.Height));
                         DrawCalibrationGrid();
                         InvalidateOnnxCache();
-                        UpdateUI($"[П{_activeProfile}] Углы заданы! Нажмите Alt+3 на старте партии.");
+                        _logger.Info($"[П{_activeProfile}] Углы доски заданы.");
+                        UpdateUI("Углы доски заданы. Нажмите Alt+3 для анализа.");
                         InvalidateScanState(requestRescan: _isRunning);
                         break;
 
                     case 3:
-                        SmartAlt3Action();
+                        _ = SmartAlt3ActionAsync();
                         break;
 
                     case 4:
                         if (CalibratableRecognizer == null)
                         {
-                            UpdateUI("[AI] Ручная калибровка не нужна; авто-поиск доски: Alt+F");
+                            UpdateUI("Калибровка фигур не требуется. Автопоиск доски: Alt+F.");
                         }
                         else
                         {
                             _fixIndex = (_fixIndex + 1) % _manualFixOrder.Length;
-                            UpdateUI($"Ручная правка ({_fixIndex + 1}/12): [{_manualFixOrder[_fixIndex].name}] -> наведите и Alt+F");
+                            UpdateUI($"Правка эталона ({_fixIndex + 1}/12): {_manualFixOrder[_fixIndex].name}. Наведите и нажмите Alt+F.");
                         }
                         break;
 
@@ -323,14 +328,19 @@ namespace ChGhost
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
                         {
-                            _logger.Error("Unable to save settings after changing coach mode.", ex);
+                            _logger.Error("Unable to save settings after changing advisor mode.", ex);
                             _startupWarning = "Не удалось сохранить настройки.";
                         }
                         _logger.Info($"StealthHumanize={_settings.StealthHumanize}");
-                        UpdateUI($"Режим тренера (Coach/Advisor): {(_settings.StealthHumanize ? "ON" : "OFF")}");
+                        UpdateUI($"Режим подсказок: {(_settings.StealthHumanize ? "вкл." : "выкл.")}");
                         InvalidateScanState(requestRescan: _isRunning, forceCalculate: true);
                         break;
+
                     case 9:
+                        Close();
+                        break;
+
+                    case 17:
                         _settings.HumanPacingEnabled = !_settings.HumanPacingEnabled;
                         try
                         {
@@ -341,7 +351,8 @@ namespace ChGhost
                             _logger.Error("Unable to save settings after changing human pacing.", ex);
                             _startupWarning = "Не удалось сохранить настройки.";
                         }
-                        UpdateUI($"Пауза на обдумывание: {(_settings.HumanPacingEnabled ? "ON" : "OFF")}");
+                        _logger.Info($"HumanPacingEnabled={_settings.HumanPacingEnabled}");
+                        UpdateUI($"Задержка перед подсказкой: {(_settings.HumanPacingEnabled ? "вкл." : "выкл.")}");
                         InvalidateScanState(requestRescan: _isRunning, forceCalculate: true);
                         break;
 
@@ -414,7 +425,7 @@ namespace ChGhost
 
             if (HasValidBoardBounds() && HasValidSignatures())
             {
-                UpdateUI($"Включён Профиль {_activeProfile} -> синхронизирую доску...");
+                UpdateUI($"Профиль {_activeProfile}: синхронизирую доску…");
                 if (_isRunning)
                     _ = RunScanAndSuggestAsync(forceCalculate: true);
             }
@@ -422,13 +433,13 @@ namespace ChGhost
             {
                 _isRunning = false;
                 _scanTimer.Stop();
-                UpdateUI($"Профиль {_activeProfile}: углы есть, нажмите 1 раз Alt+3 на старте партии!");
+                UpdateUI($"Профиль {_activeProfile}: углы заданы. Нажмите Alt+3 для анализа.");
             }
             else
             {
                 _isRunning = false;
                 _scanTimer.Stop();
-                UpdateUI($"Профиль {_activeProfile}: задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте!");
+                UpdateUI($"Профиль {_activeProfile}: задайте углы (Alt+1, Alt+2) или нажмите Alt+F.");
             }
         }
 
@@ -444,53 +455,10 @@ namespace ChGhost
         private bool HasValidSignatures() =>
             CalibratableRecognizer?.IsReady ?? _recognizer.IsReady;
 
-        private bool TryAutoDetectBoard(bool triggerScanAfter = true)
-        {
-            BoardDetectionDiagnostics diag = _autoBoardDetector.DetectWithDiagnostics();
-            if (diag.Rect is not { } rect)
-            {
-                _logger.Warn("Auto board detection did not find a chessboard.");
-                UpdateUI("Доска не найдена на экране (Alt+1 / Alt+2 вручную)");
-                return false;
-            }
-
-            _topLeft = new Point(rect.Left, rect.Top);
-            _bottomRight = new Point(rect.Right, rect.Bottom);
-            ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(rect.Left, rect.Top, rect.Width, rect.Height));
-            SaveConfig();
-
-            if (_recognizer is OnnxBoardRecognizer onnxRec)
-            {
-                try
-                {
-                    onnxRec.InvalidateCache();
-                    using Bitmap boardBmp = CaptureBoardSnapshot();
-                    BoardRecognitionResult recognition = onnxRec.Recognize(boardBmp, _playAsBlack);
-                    bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(recognition.RawGrid, _playAsBlack);
-                    if (detected.HasValue)
-                        _playAsBlack = detected.Value;
-                }
-                catch (Exception ex)
-                {
-                    _logger.Error("ONNX side auto-detection after board autodetect failed.", ex);
-                }
-            }
-
-            InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
-            ResetBoardTracking();
-            DrawCalibrationGrid();
-
-            _logger.Info($"[AUTODETECT] Board found: {rect.Left},{rect.Top} -> {rect.Right},{rect.Bottom} ({rect.Width}x{rect.Height}) | corners={diag.MatchedCorners}/49 | parity={diag.ParitySquares}/64 | ms={diag.ElapsedMs:F1}");
-            UpdateUI($"Доска найдена автоматически ({rect.Width}x{rect.Height})");
-            if (triggerScanAfter)
-                _ = RunScanAndSuggestAsync(forceCalculate: true);
-            return true;
-        }
-
-        private async Task TryAutoDetectBoardAsync(bool triggerScanAfter = true)
+        private async Task<bool> TryAutoDetectBoardAsync(bool triggerScanAfter = true)
         {
             if (_isAutoDetecting || _shutdownStarted)
-                return;
+                return false;
             _isAutoDetecting = true;
             try
             {
@@ -502,49 +470,73 @@ namespace ChGhost
                     || _shutdownStarted)
                 {
                     _logger.Info("Auto board detection result discarded: application state changed during scan.");
-                    return;
+                    return false;
                 }
                 if (diag.Rect is not { } rect)
                 {
                     _logger.Warn("Auto board detection did not find a chessboard.");
-                    UpdateUI("Доска не найдена на экране (Alt+1 / Alt+2 вручную)");
-                    return;
+                    UpdateUI("Доска не найдена. Задайте углы вручную: Alt+1 и Alt+2.");
+                    return false;
                 }
 
-                _topLeft = new Point(rect.Left, rect.Top);
-                _bottomRight = new Point(rect.Right, rect.Bottom);
-                ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(rect.Left, rect.Top, rect.Width, rect.Height));
-                SaveConfig();
-
+                bool? detectedSide = null;
                 if (_recognizer is OnnxBoardRecognizer onnxRec)
                 {
+                    bool playAsBlackSnap = _playAsBlack;
                     try
                     {
-                        onnxRec.InvalidateCache();
-                        using Bitmap boardBmp = CaptureBoardSnapshot();
-                        BoardRecognitionResult recognition = onnxRec.Recognize(boardBmp, _playAsBlack);
-                        bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(recognition.RawGrid, _playAsBlack);
-                        if (detected.HasValue)
-                            _playAsBlack = detected.Value;
+                        detectedSide = await Task.Run(() =>
+                        {
+                            onnxRec.InvalidateCache();
+                            using Bitmap boardBmp = CaptureBoardSnapshot(rect);
+                            BoardRecognitionResult recognition = onnxRec.Recognize(boardBmp, playAsBlackSnap);
+                            return OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(recognition.RawGrid, playAsBlackSnap);
+                        });
+                    }
+                    catch (ObjectDisposedException) when (_shutdownStarted)
+                    {
+                        return false;
                     }
                     catch (Exception ex)
                     {
                         _logger.Error("ONNX side auto-detection after board autodetect failed.", ex);
                     }
+
+                    if (versionSnap != Interlocked.Read(ref _stateVersion)
+                        || profileSnap != _activeProfile
+                        || _shutdownStarted)
+                    {
+                        _logger.Info("Auto board detection side check discarded: application state changed during scan.");
+                        return false;
+                    }
                 }
+
+                _topLeft = new Point(rect.Left, rect.Top);
+                _bottomRight = new Point(rect.Right, rect.Bottom);
+                if (detectedSide.HasValue)
+                    _playAsBlack = detectedSide.Value;
+                ApplyOverlayMonitorBounds(new System.Drawing.Rectangle(rect.Left, rect.Top, rect.Width, rect.Height));
+                SaveConfig();
 
                 InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
                 ResetBoardTracking();
                 DrawCalibrationGrid();
                 _logger.Info($"[AUTODETECT] Board found: {rect.Left},{rect.Top} -> {rect.Right},{rect.Bottom} ({rect.Width}x{rect.Height}) | corners={diag.MatchedCorners}/49 | parity={diag.ParitySquares}/64 | ms={diag.ElapsedMs:F1}");
-                UpdateUI($"Доска найдена автоматически ({rect.Width}x{rect.Height})");
+                UpdateUI($"Доска найдена ({rect.Width}x{rect.Height}).");
                 if (triggerScanAfter)
                     _ = RunScanAndSuggestAsync(forceCalculate: true);
+                return true;
+            }
+            catch (ObjectDisposedException) when (_shutdownStarted)
+            {
+                return false;
             }
             catch (Exception ex)
             {
                 _logger.Error("Auto board detection failed.", ex);
-                UpdateUI($"Автопоиск доски не удался: {ex.Message}");
+                if (!_shutdownStarted)
+                    UpdateUI($"Автопоиск не удался: {ex.Message}");
+                return false;
             }
             finally
             {
@@ -552,109 +544,187 @@ namespace ChGhost
             }
         }
 
-        private void SmartAlt3Action()
+        private async Task SmartAlt3ActionAsync()
         {
-            bool boardOccluded = _recognizer is OnnxBoardRecognizer onnx && !onnx.LastBoardVisible;
-            if (!HasValidBoardBounds() || boardOccluded)
-            {
-                if (TryAutoDetectBoard(triggerScanAfter: true))
-                    return;
-                if (!HasValidBoardBounds())
-                {
-                    UpdateUI("Сначала задайте углы доски: Alt+1 (верх-лево) и Alt+2 (низ-право)!");
-                    return;
-                }
-            }
-
-            if (CalibratableRecognizer == null)
-            {
-                InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
-                if (_recognizer is OnnxBoardRecognizer onnxRecognizer)
-                    TryDetectOnnxPlayAsBlack(onnxRecognizer);
-
-                ResetBoardTracking();
-                ClearGraphics();
-                if (!_isRunning)
-                {
-                    _isRunning = true;
-                    _scanTimer.Start();
-                }
-                UpdateUI("[AI] Полный пересчёт позиции с чистого листа -> считаю ход...");
-                _ = RunScanAndSuggestAsync(forceCalculate: true);
+            if (_shutdownStarted)
                 return;
-            }
 
-            if (!HasValidSignatures())
-                LoadConfig();
-
-            using Bitmap boardBmp = CaptureBoardSnapshot();
-            ICalibratableRecognizer calibratable = CalibratableRecognizer
-                ?? throw new InvalidOperationException("Template calibratable recognizer is unavailable.");
-            CalibrationOutcome calibration = calibratable.CalibrateStartingPosition(boardBmp, _playAsBlack);
-            if (calibration.IsStartingPosition)
-            {
-                _playAsBlack = calibration.PlayAsBlack;
-                SaveConfig();
-                InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
-                ResetBoardTracking();
-                ClearGraphics();
-
-                if (!_isRunning)
-                {
-                    _isRunning = true;
-                    _scanTimer.Start();
-                }
-
-                string sideDetected = _playAsBlack ? "ЧЁРНЫЕ" : "БЕЛЫЕ";
-                UpdateUI($"[П{_activeProfile}] Старт v13 снят ({sideDetected}, Б={calibration.WhiteLuma:F0}/Ч={calibration.BlackLuma:F0}) -> Считаю ход...");
-                _ = StartNewGameAndScanAsync();
-                return;
-            }
-
-            if (!HasValidSignatures())
-            {
-                UpdateUI($"[П{_activeProfile}] Нет эталонов v13 (края={calibration.BackRanksOccupied}, центр={calibration.CenterOccupied}). Нажмите 1 раз Alt+3 на стартовой доске!");
-                return;
-            }
-
-            InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
-            ResetBoardTracking();
-            ClearGraphics();
-
-            if (!_isRunning)
-            {
-                _isRunning = true;
-                _scanTimer.Start();
-            }
-
-            UpdateUI("Полный пересчёт позиции с чистого листа -> считаю ход...");
-            _ = RunScanAndSuggestAsync(forceCalculate: true);
-        }
-
-        private void TryDetectOnnxPlayAsBlack(OnnxBoardRecognizer onnxRecognizer)
-        {
             try
             {
-                onnxRecognizer.InvalidateCache();
-                using Bitmap boardBmp = CaptureBoardSnapshot();
-                BoardRecognitionResult recognition = onnxRecognizer.Recognize(boardBmp, _playAsBlack);
-                bool? detected = OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(recognition.RawGrid, _playAsBlack);
-                if (!detected.HasValue)
-                    return;
-
-                bool previous = _playAsBlack;
-                _playAsBlack = detected.Value;
-                if (_playAsBlack != previous)
+                bool boardOccluded = _recognizer is OnnxBoardRecognizer onnx && !onnx.LastBoardVisible;
+                if (!HasValidBoardBounds() || boardOccluded)
                 {
+                    if (_isAutoDetecting)
+                        return;
+
+                    long autoVersionSnap = Interlocked.Read(ref _stateVersion);
+                    int autoProfileSnap = _activeProfile;
+                    if (await TryAutoDetectBoardAsync(triggerScanAfter: true))
+                        return;
+
+                    if (autoVersionSnap != Interlocked.Read(ref _stateVersion)
+                        || autoProfileSnap != _activeProfile
+                        || _shutdownStarted)
+                        return;
+
+                    if (!HasValidBoardBounds())
+                    {
+                        UpdateUI("Сначала задайте углы доски: Alt+1 и Alt+2.");
+                        return;
+                    }
+                }
+
+                if (CalibratableRecognizer == null)
+                {
+                    InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
+                    long versionSnap = Interlocked.Read(ref _stateVersion);
+                    int profileSnap = _activeProfile;
+                    BoardRect? boundsSnap = _boardDetector.Detect();
+
+                    if (_recognizer is OnnxBoardRecognizer onnxRecognizer && boundsSnap is { IsValid: true } rect)
+                    {
+                        UpdateUI("Пересчитываю позицию…");
+                        bool playAsBlackSnap = _playAsBlack;
+                        bool? detected = null;
+                        try
+                        {
+                            detected = await Task.Run(() =>
+                            {
+                                onnxRecognizer.InvalidateCache();
+                                using Bitmap boardBmp = CaptureBoardSnapshot(rect);
+                                BoardRecognitionResult recognition = onnxRecognizer.Recognize(boardBmp, playAsBlackSnap);
+                                return OnnxBoardRecognizer.TryDetectPlayAsBlackStrict(recognition.RawGrid, playAsBlackSnap);
+                            });
+                        }
+                        catch (ObjectDisposedException) when (_shutdownStarted)
+                        {
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.Error("ONNX side auto-detection failed.", ex);
+                        }
+
+                        if (versionSnap != Interlocked.Read(ref _stateVersion)
+                            || profileSnap != _activeProfile
+                            || _shutdownStarted)
+                        {
+                            _logger.Info("Alt+3 ONNX side detection discarded: application state changed.");
+                            return;
+                        }
+
+                        if (detected.HasValue && detected.Value != _playAsBlack)
+                        {
+                            _playAsBlack = detected.Value;
+                            _logger.Info($"[AI] Авто-цвет: {(_playAsBlack ? "ЧЁРНЫЕ" : "БЕЛЫЕ")}");
+                        }
+                    }
+
+                    if (versionSnap != Interlocked.Read(ref _stateVersion)
+                        || profileSnap != _activeProfile
+                        || _shutdownStarted)
+                        return;
+
                     ResetBoardTracking();
                     ClearGraphics();
-                    RedrawOverlay();
-                    UpdateUI($"[AI] Авто-цвет: {(_playAsBlack ? "ЧЁРНЫЕ" : "БЕЛЫЕ")}");
+                    if (!_isRunning)
+                    {
+                        _isRunning = true;
+                        _scanTimer.Start();
+                    }
+                    UpdateUI("Пересчитываю позицию…");
+                    _ = RunScanAndSuggestAsync(forceCalculate: true);
+                    return;
                 }
+
+                if (!HasValidSignatures())
+                    LoadConfig();
+
+                BoardRect? templateBounds = _boardDetector.Detect();
+                if (templateBounds is not { IsValid: true } validBounds)
+                {
+                    UpdateUI("Сначала задайте углы доски: Alt+1 и Alt+2.");
+                    return;
+                }
+
+                InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
+                long templateVersionSnap = Interlocked.Read(ref _stateVersion);
+                int templateProfileSnap = _activeProfile;
+                bool templatePlayAsBlackSnap = _playAsBlack;
+                ICalibratableRecognizer calibratable = CalibratableRecognizer
+                    ?? throw new InvalidOperationException("Template calibratable recognizer is unavailable.");
+
+                CalibrationOutcome calibration;
+                try
+                {
+                    calibration = await Task.Run(() =>
+                    {
+                        using Bitmap boardBmp = CaptureBoardSnapshot(validBounds);
+                        return calibratable.CalibrateStartingPosition(boardBmp, templatePlayAsBlackSnap);
+                    });
+                }
+                catch (ObjectDisposedException) when (_shutdownStarted)
+                {
+                    return;
+                }
+
+                if (templateVersionSnap != Interlocked.Read(ref _stateVersion)
+                    || templateProfileSnap != _activeProfile
+                    || _shutdownStarted)
+                {
+                    _logger.Info("Alt+3 template calibration discarded: application state changed.");
+                    return;
+                }
+
+                if (calibration.IsStartingPosition)
+                {
+                    _playAsBlack = calibration.PlayAsBlack;
+                    SaveConfig();
+                    InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
+                    ResetBoardTracking();
+                    ClearGraphics();
+
+                    if (!_isRunning)
+                    {
+                        _isRunning = true;
+                        _scanTimer.Start();
+                    }
+
+                    string sideDetected = _playAsBlack ? "ЧЁРНЫЕ" : "БЕЛЫЕ";
+                    _logger.Info($"[П{_activeProfile}] Старт v13 снят ({sideDetected}, Б={calibration.WhiteLuma:F0}/Ч={calibration.BlackLuma:F0})");
+                    UpdateUI("Начальная позиция распознана. Анализирую…");
+                    _ = StartNewGameAndScanAsync();
+                    return;
+                }
+
+                if (!HasValidSignatures())
+                {
+                    _logger.Info($"[П{_activeProfile}] Нет эталонов v13 (края={calibration.BackRanksOccupied}, центр={calibration.CenterOccupied}).");
+                    UpdateUI("Нет эталонов. Откройте начальную позицию и нажмите Alt+3.");
+                    return;
+                }
+
+                InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
+                ResetBoardTracking();
+                ClearGraphics();
+
+                if (!_isRunning)
+                {
+                    _isRunning = true;
+                    _scanTimer.Start();
+                }
+
+                UpdateUI("Пересчитываю позицию…");
+                _ = RunScanAndSuggestAsync(forceCalculate: true);
+            }
+            catch (ObjectDisposedException) when (_shutdownStarted)
+            {
             }
             catch (Exception ex)
             {
-                _logger.Error("ONNX side auto-detection failed.", ex);
+                _logger.Error("Alt+3 action failed.", ex);
+                if (!_shutdownStarted)
+                    UpdateUI($"Ошибка анализа: {ex.Message}");
             }
         }
 
@@ -663,13 +733,13 @@ namespace ChGhost
             ICalibratableRecognizer? calibratable = CalibratableRecognizer;
             if (calibratable == null)
             {
-                UpdateUI("[AI] Ручная запись эталонов не требуется; распознавание выполняется ONNX-моделью.");
+                UpdateUI("Калибровка фигур не требуется в ONNX-режиме.");
                 return;
             }
 
             if (!HasValidBoardBounds())
             {
-                UpdateUI("Сначала задайте углы доски (Alt+1 и Alt+2)!");
+                UpdateUI("Сначала задайте углы доски: Alt+1 и Alt+2.");
                 return;
             }
 
@@ -682,7 +752,7 @@ namespace ChGhost
 
             if (col < 0 || col > 7 || row < 0 || row > 7)
             {
-                UpdateUI("Курсор вне доски! Наведите на фигуру и нажмите Alt+F.");
+                UpdateUI("Курсор вне доски. Наведите на фигуру и нажмите Alt+F.");
                 return;
             }
 
@@ -697,12 +767,12 @@ namespace ChGhost
 
             if (!HasValidSignatures())
             {
-                UpdateUI($"Записано: [{savedName}] ({calibratable.CalibrationClassCount}/12). Далее: [{_manualFixOrder[_fixIndex].name}] -> Alt+F");
+                UpdateUI($"Сохранено: {savedName} ({calibratable.CalibrationClassCount}/12). Далее: {_manualFixOrder[_fixIndex].name} (Alt+F).");
             }
             else
             {
                 ResetBoardTracking();
-                UpdateUI($"Обновлено: [{savedName}]! Далее: [{_manualFixOrder[_fixIndex].name}]");
+                UpdateUI($"Обновлено: {savedName}. Далее: {_manualFixOrder[_fixIndex].name}.");
                 if (_isRunning)
                     _ = RunScanAndSuggestAsync(forceCalculate: true);
             }
@@ -735,6 +805,8 @@ namespace ChGhost
             _debugInfo = "";
             _lastIllegalFen = "";
             _activeFen = null;
+            _lastStableFullFen = null;
+            _lastRenderedStateKey = null;
             _currentGrid = null;
             _advisorMoves.Clear();
         }
@@ -823,15 +895,12 @@ namespace ChGhost
 
         private void UpdateUI(string? customStatus = null)
         {
-            string sideText = _playAsBlack ? "ЧЁРНЫЕ" : "БЕЛЫЕ";
-            string stateText = _isRunning ? "РАБОТАЕТ" : "ПАУЗА";
-            string speedText = _isBlitzTurboMode ? "БЛИЦ" : "РАПИД";
-            string powerText = _settings.FullStrength ? $"MAX • {_settings.EffectiveEngineThreads}T" : _settings.TargetElo.ToString();
+            string sideText = _playAsBlack ? "Чёрные" : "Белые";
+            string stateText = _isRunning ? "Анализ" : "Пауза";
+            string speedText = _isBlitzTurboMode ? "Блиц" : "Рапид";
+            string strengthSuffix = _settings.FullStrength ? "" : $" · {_settings.TargetElo}";
 
-            string recognizerText = CalibratableRecognizer == null
-                ? (_settings.StealthHumanize ? "[AI·C]" : "[AI]")
-                : $"[П{_activeProfile}]";
-            HeaderText.Text = $"CHESS GHOST {recognizerText} • {sideText} • {stateText} • {speedText} ({powerText})";
+            HeaderText.Text = $"ChGhost · {sideText} · {stateText} · {speedText}{strengthSuffix}";
             HeaderText.Foreground = _isRunning
                 ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(0, 255, 136))
                 : new SolidColorBrush(System.Windows.Media.Color.FromRgb(255, 200, 60));
@@ -850,28 +919,28 @@ namespace ChGhost
 
             if (!HasValidBoardBounds())
             {
-                StatusText.Text = $"[П{_activeProfile}] 1. Alt+F: авто | 2. Угол A8 -> Alt+1 | Угол H1 -> Alt+2 | Alt+P: профиль";
+                StatusText.Text = "Alt+F автопоиск доски · или Alt+1 (верх-лево) и Alt+2 (низ-право)";
                 return;
             }
 
             if (!HasValidSignatures())
             {
-                StatusText.Text = $"[П{_activeProfile}] Откройте старт партии и нажмите 1 раз Alt+3 | Alt+P: профиль";
+                StatusText.Text = "Нет эталонов. Откройте начальную позицию и нажмите Alt+3.";
                 return;
             }
 
             if (_isRunning)
             {
                 if (!string.IsNullOrEmpty(_lastMoveRussianText))
-                    StatusText.Text = $"ТВОЙ ХОД: {_lastMoveRussianText} | Alt+3: обновить | Alt+P: профиль";
+                    StatusText.Text = $"Ваш ход: {_lastMoveRussianText}";
                 else if (!string.IsNullOrEmpty(_debugInfo))
                     StatusText.Text = _debugInfo;
                 else
-                    StatusText.Text = "Жду хода соперника... (Alt+3: пересчитать | Alt+P: профиль)";
+                    StatusText.Text = "Ожидание хода соперника…";
             }
             else
             {
-                StatusText.Text = $"Готово [П{_activeProfile}]! Alt+3 или Alt+S: старт | Alt+P: профиль | Alt+B: {speedText}";
+                StatusText.Text = "Пауза · Alt+3 для анализа";
             }
         }
 
@@ -887,7 +956,8 @@ namespace ChGhost
             string cfgPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, GetActiveDbFileName());
             if (File.Exists(cfgPath)) File.Delete(cfgPath);
             ClearGraphics();
-            UpdateUI($"[П{_activeProfile}] Сброшено! Задайте углы доски: Alt+1 и Alt+2.");
+            _logger.Info($"[П{_activeProfile}] Калибровка сброшена.");
+            UpdateUI("Калибровка сброшена. Задайте углы: Alt+1 и Alt+2.");
         }
 
         private void SaveConfig()
@@ -1015,9 +1085,7 @@ namespace ChGhost
         {
             if (!HasValidBoardBounds() || !HasValidSignatures())
             {
-                UpdateUI(CalibratableRecognizer == null
-                    ? "[AI] Сначала найдите доску (Alt+F) или задайте углы (Alt+1 и Alt+2), затем Alt+3."
-                    : $"[П{_activeProfile}] Сначала найдите доску (Alt+F) или задайте углы (Alt+1, Alt+2) и нажмите Alt+3 на старте партии!");
+                UpdateUI("Сначала найдите доску (Alt+F) или задайте углы (Alt+1, Alt+2).");
                 return;
             }
 
@@ -1162,6 +1230,11 @@ namespace ChGhost
         private Bitmap CaptureBoardSnapshot()
         {
             BoardRect bounds = _boardDetector.Detect() ?? throw new InvalidOperationException("Board bounds are not configured.");
+            return CaptureBoardSnapshot(bounds);
+        }
+
+        private static Bitmap CaptureBoardSnapshot(BoardRect bounds)
+        {
             Bitmap bmp = new Bitmap(bounds.Width, bounds.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
             using Graphics g = Graphics.FromImage(bmp);
             g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, new System.Drawing.Size(bounds.Width, bounds.Height));
@@ -1221,7 +1294,7 @@ namespace ChGhost
                             _logger.Info("Board is occluded; pausing board scans.");
                             _lastBoardVisible = false;
                         }
-                        UpdateUI("Доска перекрыта / не видна — сканирование на паузе");
+                        UpdateUI("Доска не видна — анализ приостановлен.");
                         await MaybeUnloadIdleEngineAsync();
                         return;
                     }
@@ -1251,7 +1324,8 @@ namespace ChGhost
 
                 if (!tracking.IsValid)
                 {
-                    _debugInfo = $"Не вижу королей (Б={tracking.WhiteKings}, Ч={tracking.BlackKings}). Нажмите Alt+3 для пересчёта.";
+                    _logger.Warn($"Invalid king count: white={tracking.WhiteKings}, black={tracking.BlackKings}");
+                    _debugInfo = "Не удалось распознать оба короля. Нажмите Alt+3 для пересчёта.";
                     UpdateUI();
                     return;
                 }
@@ -1260,10 +1334,13 @@ namespace ChGhost
                 _currentGrid = stableGrid;
                 _debugInfo = "";
 
+                string fullFen = BuildFullFen(tracking, playAsBlackSnap);
+                _lastStableFullFen = fullFen;
+
                 if (tracking.IsUnchanged)
                 {
                     await MaybeUnloadIdleEngineAsync();
-                    RedrawOverlay();
+                    RedrawOverlayIfNeeded(fullFen);
                     return;
                 }
 
@@ -1274,23 +1351,18 @@ namespace ChGhost
                     _lastMoveIsCastling = false;
                     _advisorMoves.Clear();
                     await MaybeUnloadIdleEngineAsync();
-                    RedrawOverlay();
-                    UpdateUI("Жду хода соперника... (Alt+3: если соперник уже сходил)");
+                    RedrawOverlayIfNeeded(fullFen);
+                    UpdateUI("Ожидание хода соперника…");
                     return;
                 }
 
                 if (!tracking.ShouldCalculateMove)
                 {
                     await MaybeUnloadIdleEngineAsync();
-                    RedrawOverlay();
+                    RedrawOverlayIfNeeded(fullFen);
                     return;
                 }
 
-                char turn = playAsBlackSnap ? 'b' : 'w';
-                string epTarget = tracking.EnPassantTarget;
-                bool epMatchesTurn = epTarget != "-" && epTarget.Length == 2
-                    && ((turn == 'w' && epTarget[1] == '6') || (turn == 'b' && epTarget[1] == '3'));
-                string fullFen = $"{tracking.StableFen} {turn} {tracking.CastlingRights} {(epMatchesTurn ? epTarget : "-")} {tracking.HalfmoveClock} {tracking.FullmoveNumber}";
                 _activeFen = fullFen;
                 int moveTimeMs = _isBlitzTurboMode ? _settings.MoveTimeBlitzMs : _settings.MoveTimeRapidMs;
 
@@ -1309,7 +1381,9 @@ namespace ChGhost
                 }
 
                 _advisorMoves.Clear();
-                bool useHumanizer = _settings.StealthHumanize && _settings.MultiPvCount > 1;
+                bool useHumanizer = _settings.StealthHumanize
+                    && _settings.HumanPacingEnabled
+                    && _settings.MultiPvCount > 1;
                 int requestedMultiPv = Math.Clamp(_settings.MultiPvCount, 1, 6);
                 IReadOnlyList<CandidateMove> candidates = Array.Empty<CandidateMove>();
                 string bestMove = "(none)";
@@ -1418,7 +1492,7 @@ namespace ChGhost
                         _lastMoveRussianText = $"{pieceRus} {fromSq} → {toSq}{promoSuffix}";
                     }
 
-                    RedrawOverlay();
+                    RedrawOverlay(fullFen);
                     UpdateUI();
                 }
             }
@@ -1473,8 +1547,30 @@ namespace ChGhost
             return task;
         }
 
+        private static string BuildFullFen(TrackingUpdate tracking, bool playAsBlack)
+        {
+            char turn = playAsBlack ? 'b' : 'w';
+            string epTarget = tracking.EnPassantTarget;
+            bool epMatchesTurn = epTarget != "-" && epTarget.Length == 2
+                && ((turn == 'w' && epTarget[1] == '6') || (turn == 'b' && epTarget[1] == '3'));
+            return $"{tracking.StableFen} {turn} {tracking.CastlingRights} {(epMatchesTurn ? epTarget : "-")} {tracking.HalfmoveClock} {tracking.FullmoveNumber}";
+        }
+
+        private string BuildRenderStateKey(string? fullFen)
+        {
+            BoardRect? bounds = _boardDetector.Detect();
+            string boundsKey = bounds is { IsValid: true } b
+                ? $"{b.Left},{b.Top},{b.Right},{b.Bottom}|{_overlayMonitorBounds.Left},{_overlayMonitorBounds.Top},{_overlayMonitorBounds.Width},{_overlayMonitorBounds.Height}"
+                : "none";
+            string advisorKey = _settings.ShowAdvisorArrows && _advisorMoves.Count > 0
+                ? string.Join(",", _advisorMoves)
+                : "-";
+            return $"{_isRunning}|{_settings.StealthHumanize}|{_settings.HumanPacingEnabled}|{_settings.ShowAdvisorArrows}|{_playAsBlack}|{fullFen ?? "-"}|{_lastBestMove}|{_lastMoveIsCastling}|{advisorKey}|{_showDebugOverlay}|{boundsKey}";
+        }
+
         private void ClearGraphics()
         {
+            _lastRenderedStateKey = null;
             for (int i = OverlayCanvas.Children.Count - 1; i >= 0; i--)
             {
                 if (OverlayCanvas.Children[i] != StatusBox)
@@ -1482,7 +1578,15 @@ namespace ChGhost
             }
         }
 
-        private void RedrawOverlay()
+        private void RedrawOverlayIfNeeded(string? fullFen)
+        {
+            string renderKey = BuildRenderStateKey(fullFen);
+            if (string.Equals(renderKey, _lastRenderedStateKey, StringComparison.Ordinal))
+                return;
+            RedrawOverlay(fullFen);
+        }
+
+        private void RedrawOverlay(string? fullFen = null)
         {
             ClearGraphics();
             if (_showDebugOverlay && _currentGrid != null)
@@ -1517,6 +1621,7 @@ namespace ChGhost
                 else
                     DrawSingleArrow(_lastBestMove, System.Windows.Media.Color.FromArgb(215, 0, 255, 136), thickness: 8);
             }
+            _lastRenderedStateKey = BuildRenderStateKey(fullFen ?? _activeFen ?? _lastStableFullFen);
         }
 
         private void DrawXRayLabels(char[,] grid)

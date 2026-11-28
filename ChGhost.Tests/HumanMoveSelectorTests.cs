@@ -154,6 +154,33 @@ public class HumanMoveSelectorTests
         }
     }
 
+    [Fact]
+    public void Select_PacingDisabled_AlwaysReturnsBestMoveWithZeroDelayAndNoRandomness()
+    {
+        var candidates = new[]
+        {
+            Cp("d2d4", 28, 2),
+            Cp("e2e4", 30, 1),
+            Cp("c2c4", 26, 3),
+            Cp("g1f3", 25, 4)
+        };
+        var options = new HumanizerOptions(
+            MaxCpLoss: 45,
+            AdvisorMaxGapCp: 65,
+            AdvisorMaxArrows: 2,
+            PacingEnabled: false,
+            MinDelayMs: 200,
+            MaxDelayMs: 800);
+
+        MoveRecommendation rec = HumanMoveSelector.Select(candidates, EmptyGrid(), options, new ThrowingRandom());
+
+        Assert.Equal("e2e4", rec.Primary.Uci);
+        Assert.Equal(1, rec.Primary.MultiPvIndex);
+        Assert.Equal(1, rec.PickIndex);
+        Assert.Equal(0, rec.RecommendedDelayMs);
+        Assert.Empty(rec.Alternatives);
+    }
+
     private static CandidateMove Cp(string uci, int scoreCp, int multiPv)
         => new(uci, scoreCp, false, 0, 20, multiPv);
 
@@ -169,5 +196,11 @@ public class HumanMoveSelectorTests
     private sealed class FirstRollRandom : Random
     {
         public override double NextDouble() => 0.0;
+    }
+
+    private sealed class ThrowingRandom : Random
+    {
+        public override double NextDouble() => throw new InvalidOperationException("Random should not be called.");
+        public override int Next(int minValue, int maxValue) => throw new InvalidOperationException("Random should not be called.");
     }
 }

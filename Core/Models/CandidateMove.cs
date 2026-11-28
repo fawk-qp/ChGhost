@@ -34,4 +34,7 @@ public sealed record MoveRecommendation(
     CandidateMove Primary,
     IReadOnlyList<CandidateMove> Alternatives,
     int RecommendedDelayMs,
-    double ComplexityScore);
+    double ComplexityScore)
+{
+    public int PickIndex => Primary.MultiPvIndex;
+}

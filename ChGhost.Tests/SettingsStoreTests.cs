@@ -153,6 +153,24 @@ public class SettingsStoreTests
         Assert.Equal(expected, settings.EngineHashMb);
     }
 
+    [Theory]
+    [InlineData(-50, 0)]
+    [InlineData(0, 0)]
+    [InlineData(45, 45)]
+    [InlineData(300, 300)]
+    [InlineData(301, 300)]
+    [InlineData(2000, 300)]
+    public void HumanMaxCpLossIsClampedToMaximum300(int configured, int expected)
+    {
+        var settings = AppSettings.CreateDefaults();
+        settings.HumanMaxCpLoss = configured;
+
+        settings.Normalize();
+
+        Assert.InRange(settings.HumanMaxCpLoss, 0, 300);
+        Assert.Equal(expected, settings.HumanMaxCpLoss);
+    }
+
     private sealed class TestLogger : IAppLogger
     {
         public List<string> Errors { get; } = new();

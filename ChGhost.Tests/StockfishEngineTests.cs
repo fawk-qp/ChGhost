@@ -65,6 +65,25 @@ public class StockfishEngineTests
         await engine.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
     }
 
+    [Theory]
+    [InlineData("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\nquit")]
+    [InlineData("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\rstop")]
+    [InlineData("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\0")]
+    [InlineData("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0")]
+    [InlineData("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 extra")]
+    [InlineData("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -  0 1")]
+    [InlineData(" ")]
+    public async Task InvalidFenIsRejectedWithArgumentException(string invalidFen)
+    {
+        string missingPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"), "stockfish.exe");
+        await using var engine = new StockfishEngine(missingPath, AppSettings.CreateDefaults(), new TestLogger());
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            engine.GetBestMoveAsync(invalidFen, 100, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            engine.GetTopMovesAsync(invalidFen, 100, 2, CancellationToken.None));
+    }
+
     private static string? FindStockfishExecutable()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);

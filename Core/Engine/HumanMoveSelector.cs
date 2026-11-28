@@ -28,12 +28,13 @@ public static class HumanMoveSelector
 
         var best = ordered[0];
 
+        if (!options.PacingEnabled)
+            return new MoveRecommendation(best, Array.Empty<CandidateMove>(), 0, 0.0);
+
         // 1. Единственный кандидат или форсированный мат — играем точно и без лишней задержки
         if (ordered.Count == 1 || (best.IsMate && Math.Abs(best.MateIn) <= MateForcedThreshold))
         {
-            int fastDelay = options.PacingEnabled
-                ? Math.Min(options.MinDelayMs, rng.Next(40, Math.Max(45, Math.Min(140, options.MaxDelayMs))))
-                : 0;
+            int fastDelay = Math.Min(options.MinDelayMs, rng.Next(40, Math.Max(45, Math.Min(140, options.MaxDelayMs))));
             return new MoveRecommendation(best, Array.Empty<CandidateMove>(), fastDelay, 0.05);
         }
 
