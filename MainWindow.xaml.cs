@@ -81,6 +81,7 @@ namespace ChGhost
         private int _rescanForce;
         private System.Drawing.Rectangle _overlayMonitorBounds = System.Drawing.Rectangle.Empty;
         private bool _isAutoDetecting;
+        private bool _isCalibrating;
 
         private readonly DispatcherTimer _scanTimer = new();
         private string _lastBestMove = "";
@@ -455,7 +456,14 @@ namespace ChGhost
         private bool HasValidSignatures() =>
             CalibratableRecognizer?.IsReady ?? _recognizer.IsReady;
 
-        private async Task<bool> TryAutoDetectBoardAsync(bool triggerScanAfter = true)
+        private Task<bool> TryAutoDetectBoardAsync(bool triggerScanAfter = true)
+        {
+            if (_isCalibrating)
+                return Task.FromResult(false);
+            return TryAutoDetectBoardCoreAsync(triggerScanAfter);
+        }
+
+        private async Task<bool> TryAutoDetectBoardCoreAsync(bool triggerScanAfter)
         {
             if (_isAutoDetecting || _shutdownStarted)
                 return false;
@@ -546,20 +554,18 @@ namespace ChGhost
 
         private async Task SmartAlt3ActionAsync()
         {
-            if (_shutdownStarted)
+            if (_shutdownStarted || _isCalibrating || _isAutoDetecting)
                 return;
 
+            _isCalibrating = true;
             try
             {
                 bool boardOccluded = _recognizer is OnnxBoardRecognizer onnx && !onnx.LastBoardVisible;
                 if (!HasValidBoardBounds() || boardOccluded)
                 {
-                    if (_isAutoDetecting)
-                        return;
-
                     long autoVersionSnap = Interlocked.Read(ref _stateVersion);
                     int autoProfileSnap = _activeProfile;
-                    if (await TryAutoDetectBoardAsync(triggerScanAfter: true))
+                    if (await TryAutoDetectBoardCoreAsync(triggerScanAfter: true))
                         return;
 
                     if (autoVersionSnap != Interlocked.Read(ref _stateVersion)
@@ -660,7 +666,7 @@ namespace ChGhost
                     calibration = await Task.Run(() =>
                     {
                         using Bitmap boardBmp = CaptureBoardSnapshot(validBounds);
-                        return calibratable.CalibrateStartingPosition(boardBmp, templatePlayAsBlackSnap);
+                        return calibratable.ComputeStartingPositionCalibration(boardBmp, templatePlayAsBlackSnap);
                     });
                 }
                 catch (ObjectDisposedException) when (_shutdownStarted)
@@ -678,6 +684,7 @@ namespace ChGhost
 
                 if (calibration.IsStartingPosition)
                 {
+                    calibratable.ApplyCalibration(calibration);
                     _playAsBlack = calibration.PlayAsBlack;
                     SaveConfig();
                     InvalidateScanState(requestRescan: _isScanning, forceCalculate: _isScanning);
@@ -726,10 +733,20 @@ namespace ChGhost
                 if (!_shutdownStarted)
                     UpdateUI($"Ошибка анализа: {ex.Message}");
             }
+            finally
+            {
+                _isCalibrating = false;
+            }
         }
 
         private void ManualFixPieceAtCursor(Point cursor)
         {
+            if (_shutdownStarted || _isCalibrating || _isAutoDetecting)
+            {
+                UpdateUI("Дождитесь завершения калибровки.");
+                return;
+            }
+
             ICalibratableRecognizer? calibratable = CalibratableRecognizer;
             if (calibratable == null)
             {
@@ -756,6 +773,7 @@ namespace ChGhost
                 return;
             }
 
+            InvalidateScanState(requestRescan: _isRunning, forceCalculate: true);
             char targetFen = _manualFixOrder[_fixIndex].fen;
             string savedName = _manualFixOrder[_fixIndex].name;
 
@@ -946,6 +964,7 @@ namespace ChGhost
 
         private void ResetAllCalibration()
         {
+            InvalidateScanState();
             _isRunning = false;
             _scanTimer.Stop();
             CalibratableRecognizer?.ResetCalibration();
@@ -1381,9 +1400,9 @@ namespace ChGhost
                 }
 
                 _advisorMoves.Clear();
-                bool useHumanizer = _settings.StealthHumanize
-                    && _settings.HumanPacingEnabled
-                    && _settings.MultiPvCount > 1;
+                bool isAdvisorMode = _settings.StealthHumanize && _settings.ShowAdvisorArrows;
+                bool useMultiPv = (isAdvisorMode && _settings.MultiPvCount > 1)
+                    || (_settings.StealthHumanize && _settings.HumanPacingEnabled && _settings.MultiPvCount > 1);
                 int requestedMultiPv = Math.Clamp(_settings.MultiPvCount, 1, 6);
                 IReadOnlyList<CandidateMove> candidates = Array.Empty<CandidateMove>();
                 string bestMove = "(none)";
@@ -1391,7 +1410,7 @@ namespace ChGhost
                 int pvCount = 1;
                 int pickIndex = 1;
                 var sfStopwatch = System.Diagnostics.Stopwatch.StartNew();
-                if (useHumanizer)
+                if (useMultiPv)
                 {
                     candidates = await _engine.GetTopMovesAsync(fullFen, moveTimeMs, requestedMultiPv, scanToken);
                     pvCount = candidates.Count;
@@ -1404,7 +1423,7 @@ namespace ChGhost
                 if (IsStale() || (!_isRunning && !forceCalculate) || scanToken.IsCancellationRequested)
                     return;
 
-                if (useHumanizer)
+                if (useMultiPv)
                 {
                     if (candidates.Count == 0)
                     {
@@ -1418,10 +1437,11 @@ namespace ChGhost
                             AdvisorMaxGapCp: _settings.AdvisorMaxGapCp,
                             PacingEnabled: _settings.HumanPacingEnabled,
                             MinDelayMs: _isBlitzTurboMode ? _settings.HumanDelayBlitzMinMs : _settings.HumanDelayRapidMinMs,
-                            MaxDelayMs: _isBlitzTurboMode ? _settings.HumanDelayBlitzMaxMs : _settings.HumanDelayRapidMaxMs);
+                            MaxDelayMs: _isBlitzTurboMode ? _settings.HumanDelayBlitzMaxMs : _settings.HumanDelayRapidMaxMs,
+                            AdvisorMode: isAdvisorMode);
                         MoveRecommendation rec = HumanMoveSelector.Select(candidates, stableGrid, humanizerOptions, _rng);
                         bestMove = rec.Primary.Uci;
-                        pickIndex = rec.Primary.MultiPvIndex;
+                        pickIndex = rec.PickIndex;
                         if (_settings.ShowAdvisorArrows)
                         {
                             foreach (CandidateMove alt in rec.Alternatives.Take(2))

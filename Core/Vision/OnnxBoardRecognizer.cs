@@ -272,49 +272,14 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
             if (dirtyCount > 0)
             {
                 PackDirtyTilesToTensor(stride, dirtyCount);
-
-                Span<double> probs = stackalloc double[NumClasses];
-                if (_fixedBatchOne)
+                try
                 {
-                    for (int i = 0; i < dirtyCount; i++)
-                    {
-                        int tileIdx = _dirtyTiles[i];
-                        int sr = tileIdx >> 3;
-                        int sc = tileIdx & 7;
-
-                        var singleTensor = new DenseTensor<float>(
-                            _tensorBuffer.AsMemory(i * _sampleFloatLength, _sampleFloatLength),
-                            new[] { 1, 3, _tileSize, _tileSize });
-                        var singleInputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, singleTensor) };
-                        using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> singleOutputs = _session.Run(singleInputs);
-                        Tensor<float> singleLogits = singleOutputs.First(v => v.Name == _outputName).AsTensor<float>();
-
-                        ComputeSoftmax(singleLogits, 0, probs);
-                        for (int k = 0; k < NumClasses; k++)
-                            _cachedScreenProbs[sr, sc, k] = probs[k];
-                    }
+                    RunInference(dirtyCount);
                 }
-                else
+                catch
                 {
-                    int floatCount = dirtyCount * _sampleFloatLength;
-                    var inputTensor = new DenseTensor<float>(
-                        _tensorBuffer.AsMemory(0, floatCount),
-                        new[] { dirtyCount, 3, _tileSize, _tileSize });
-
-                    var inputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, inputTensor) };
-                    using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> outputs = _session.Run(inputs);
-                    Tensor<float> logitsTensor = outputs.First(v => v.Name == _outputName).AsTensor<float>();
-
-                    for (int i = 0; i < dirtyCount; i++)
-                    {
-                        int tileIdx = _dirtyTiles[i];
-                        int sr = tileIdx >> 3;
-                        int sc = tileIdx & 7;
-
-                        ComputeSoftmax(logitsTensor, i, probs);
-                        for (int k = 0; k < NumClasses; k++)
-                            _cachedScreenProbs[sr, sc, k] = probs[k];
-                    }
+                    InvalidateCache();
+                    throw;
                 }
 
                 // Сохраняем текущий буфер пикселей как эталон для следующего кадра
@@ -383,6 +348,53 @@ public sealed class OnnxBoardRecognizer : IBoardRecognizer, IDisposable
         }
 
         return stride;
+    }
+
+    private void RunInference(int dirtyCount)
+    {
+        Span<double> probs = stackalloc double[NumClasses];
+        if (_fixedBatchOne)
+        {
+            for (int i = 0; i < dirtyCount; i++)
+            {
+                int tileIdx = _dirtyTiles[i];
+                int sr = tileIdx >> 3;
+                int sc = tileIdx & 7;
+
+                var singleTensor = new DenseTensor<float>(
+                    _tensorBuffer.AsMemory(i * _sampleFloatLength, _sampleFloatLength),
+                    new[] { 1, 3, _tileSize, _tileSize });
+                var singleInputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, singleTensor) };
+                using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> singleOutputs = _session.Run(singleInputs);
+                Tensor<float> singleLogits = singleOutputs.First(v => v.Name == _outputName).AsTensor<float>();
+
+                ComputeSoftmax(singleLogits, 0, probs);
+                for (int k = 0; k < NumClasses; k++)
+                    _cachedScreenProbs[sr, sc, k] = probs[k];
+            }
+        }
+        else
+        {
+            int floatCount = dirtyCount * _sampleFloatLength;
+            var inputTensor = new DenseTensor<float>(
+                _tensorBuffer.AsMemory(0, floatCount),
+                new[] { dirtyCount, 3, _tileSize, _tileSize });
+
+            var inputs = new[] { NamedOnnxValue.CreateFromTensor(_inputName, inputTensor) };
+            using IDisposableReadOnlyCollection<DisposableNamedOnnxValue> outputs = _session.Run(inputs);
+            Tensor<float> logitsTensor = outputs.First(v => v.Name == _outputName).AsTensor<float>();
+
+            for (int i = 0; i < dirtyCount; i++)
+            {
+                int tileIdx = _dirtyTiles[i];
+                int sr = tileIdx >> 3;
+                int sc = tileIdx & 7;
+
+                ComputeSoftmax(logitsTensor, i, probs);
+                for (int k = 0; k < NumClasses; k++)
+                    _cachedScreenProbs[sr, sc, k] = probs[k];
+            }
+        }
     }
 
     private int CollectDirtyTiles(int stride, bool forceFull)

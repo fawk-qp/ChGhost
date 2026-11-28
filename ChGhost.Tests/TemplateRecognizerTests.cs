@@ -35,6 +35,52 @@ public class TemplateRecognizerTests
         Assert.Equal("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR", result.RawFen);
     }
 
+    [Fact]
+    public void ComputeStartingPositionCalibration_DoesNotMutateStateUntilApplyCalibration()
+    {
+        using Bitmap bitmap = CreateStartingBoard();
+        var recognizer = new TemplateRecognizer();
+
+        CalibrationOutcome computed = recognizer.ComputeStartingPositionCalibration(bitmap, playAsBlack: false);
+
+        Assert.True(computed.IsStartingPosition);
+        Assert.False(recognizer.IsReady);
+        Assert.Equal(0, recognizer.CalibrationClassCount);
+        Assert.Equal("8/8/8/8/8/8/8/8", recognizer.Recognize(bitmap, playAsBlack: false).RawFen);
+
+        recognizer.ApplyCalibration(computed);
+
+        Assert.True(recognizer.IsReady);
+        Assert.Equal(12, recognizer.CalibrationClassCount);
+        Assert.Equal("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR", recognizer.Recognize(bitmap, playAsBlack: false).RawFen);
+    }
+
+    [Fact]
+    public void DiscardedComputedCalibration_LeavesExistingOrSwitchedProfileSignaturesUntouched()
+    {
+        using Bitmap board = CreateStartingBoard();
+        var recognizer = new TemplateRecognizer();
+
+        // Simulate profile 1 being calibrated before an async computation completes
+        CalibrationOutcome staleComputed = recognizer.ComputeStartingPositionCalibration(board, playAsBlack: false);
+        Assert.True(staleComputed.IsStartingPosition);
+
+        // Simulate switching to profile 2 and loading a single manual signature
+        recognizer.ResetCalibration();
+        recognizer.CalibratePiece(board, new Square(7, 4), PieceClass.WhiteKing);
+        SavedConfig beforeDiscard = recognizer.ExportCalibration();
+        Assert.Equal(1, recognizer.CalibrationClassCount);
+        Assert.False(recognizer.IsReady);
+
+        // Stale background calibration is discarded (ApplyCalibration is NOT called)
+        SavedConfig afterDiscard = recognizer.ExportCalibration();
+        Assert.Equal(1, recognizer.CalibrationClassCount);
+        Assert.False(recognizer.IsReady);
+        Assert.Single(afterDiscard.Signatures);
+        Assert.True(afterDiscard.Signatures.ContainsKey('K'));
+        Assert.Equal(beforeDiscard.WhiteBodyR, afterDiscard.WhiteBodyR);
+    }
+
     private static Bitmap CreateStartingBoard()
     {
         var bitmap = new Bitmap(640, 640);

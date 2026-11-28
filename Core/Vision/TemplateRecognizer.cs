@@ -31,8 +31,9 @@ public sealed class TemplateRecognizer : ICalibratableRecognizer
         get { lock (_sync) return _pieceSignatures.Count; }
     }
 
-    public CalibrationOutcome CalibrateStartingPosition(Bitmap board, bool playAsBlack)
+    public CalibrationOutcome ComputeStartingPositionCalibration(Bitmap board, bool playAsBlack)
     {
+        ArgumentNullException.ThrowIfNull(board);
         RecognitionSnapshot snapshot = CaptureSnapshot();
         var templatesGrid = new PieceTemplate[8, 8];
         int backRanksOccupied = 0;
@@ -79,47 +80,91 @@ public sealed class TemplateRecognizer : ICalibratableRecognizer
                 detectedPlayAsBlack = false;
         }
 
-        if (isStartingPosition)
-        {
-            string[] startRows =
-            {
-                "rnbqkbnr", "pppppppp", "........", "........",
-                "........", "........", "PPPPPPPP", "RNBQKBNR"
-            };
-            var signatures = new Dictionary<char, List<PieceTemplate>>();
-            for (int r = 0; r < 8; r++)
-            {
-                for (int c = 0; c < 8; c++)
-                {
-                    int boardR = detectedPlayAsBlack ? 7 - r : r;
-                    int boardC = detectedPlayAsBlack ? 7 - c : c;
-                    char piece = startRows[boardR][boardC];
-                    if (piece == '.') continue;
-                    PieceTemplate template = templatesGrid[r, c];
-                    template.IsWhite = char.IsUpper(piece);
-                    if (!signatures.TryGetValue(piece, out var samples))
-                        signatures[piece] = samples = new List<PieceTemplate>();
-                    samples.Add(template);
-                }
-            }
-
-            lock (_sync)
-            {
-                _pieceSignatures = signatures;
-                RecalculateBodyColors();
-            }
-        }
-
-        lock (_sync)
+        if (!isStartingPosition)
         {
             return new CalibrationOutcome(
-                isStartingPosition,
+                false,
                 backRanksOccupied,
                 centerOccupied,
                 detectedPlayAsBlack,
-                0.299 * _whiteBodyR + 0.587 * _whiteBodyG + 0.114 * _whiteBodyB,
-                0.299 * _blackBodyR + 0.587 * _blackBodyG + 0.114 * _blackBodyB);
+                0.299 * snapshot.WhiteBodyR + 0.587 * snapshot.WhiteBodyG + 0.114 * snapshot.WhiteBodyB,
+                0.299 * snapshot.BlackBodyR + 0.587 * snapshot.BlackBodyG + 0.114 * snapshot.BlackBodyB);
         }
+
+        string[] startRows =
+        {
+            "rnbqkbnr", "pppppppp", "........", "........",
+            "........", "........", "PPPPPPPP", "RNBQKBNR"
+        };
+        var signatures = new Dictionary<char, List<PieceTemplate>>();
+        for (int r = 0; r < 8; r++)
+        {
+            for (int c = 0; c < 8; c++)
+            {
+                int boardR = detectedPlayAsBlack ? 7 - r : r;
+                int boardC = detectedPlayAsBlack ? 7 - c : c;
+                char piece = startRows[boardR][boardC];
+                if (piece == '.') continue;
+                PieceTemplate template = templatesGrid[r, c];
+                template.IsWhite = char.IsUpper(piece);
+                if (!signatures.TryGetValue(piece, out var samples))
+                    signatures[piece] = samples = new List<PieceTemplate>();
+                samples.Add(template);
+            }
+        }
+
+        var (wR, wG, wB, bR, bG, bB) = CalculateBodyColors(
+            signatures,
+            snapshot.WhiteBodyR, snapshot.WhiteBodyG, snapshot.WhiteBodyB,
+            snapshot.BlackBodyR, snapshot.BlackBodyG, snapshot.BlackBodyB);
+
+        var immutableSignatures = signatures.ToDictionary(
+            pair => pair.Key,
+            pair => (IReadOnlyList<PieceTemplate>)pair.Value.AsReadOnly());
+
+        return new CalibrationOutcome(
+            true,
+            backRanksOccupied,
+            centerOccupied,
+            detectedPlayAsBlack,
+            0.299 * wR + 0.587 * wG + 0.114 * wB,
+            0.299 * bR + 0.587 * bG + 0.114 * bB)
+        {
+            Signatures = immutableSignatures,
+            WhiteBodyR = wR,
+            WhiteBodyG = wG,
+            WhiteBodyB = wB,
+            BlackBodyR = bR,
+            BlackBodyG = bG,
+            BlackBodyB = bB
+        };
+    }
+
+    public void ApplyCalibration(CalibrationOutcome calibration)
+    {
+        ArgumentNullException.ThrowIfNull(calibration);
+        if (!calibration.IsStartingPosition || calibration.Signatures is null)
+            return;
+
+        Dictionary<char, List<PieceTemplate>> cloned = CloneSignatures(calibration.Signatures);
+        lock (_sync)
+        {
+            _pieceSignatures = cloned;
+            _whiteBodyR = calibration.WhiteBodyR;
+            _whiteBodyG = calibration.WhiteBodyG;
+            _whiteBodyB = calibration.WhiteBodyB;
+            _blackBodyR = calibration.BlackBodyR;
+            _blackBodyG = calibration.BlackBodyG;
+            _blackBodyB = calibration.BlackBodyB;
+        }
+    }
+
+    public CalibrationOutcome CalibrateStartingPosition(Bitmap board, bool playAsBlack)
+    {
+        CalibrationOutcome outcome = ComputeStartingPositionCalibration(board, playAsBlack);
+        if (outcome.IsStartingPosition)
+            ApplyCalibration(outcome);
+        return outcome;
     }
 
     public bool CalibratePiece(Bitmap board, Square square, PieceClass piece)
@@ -254,20 +299,29 @@ public sealed class TemplateRecognizer : ICalibratableRecognizer
         }
     }
 
-    private static Dictionary<char, List<PieceTemplate>> CloneSignatures(Dictionary<char, List<PieceTemplate>> signatures) =>
+    private static Dictionary<char, List<PieceTemplate>> CloneSignatures(
+        IReadOnlyDictionary<char, IReadOnlyList<PieceTemplate>> signatures) =>
         signatures.ToDictionary(
             pair => pair.Key,
-            pair => pair.Value.Select(template => new PieceTemplate
-            {
-                EdgePatch = (double[])template.EdgePatch.Clone(),
-                BodyR = template.BodyR,
-                BodyG = template.BodyG,
-                BodyB = template.BodyB,
-                PieceLuma = template.PieceLuma,
-                RawContrast = template.RawContrast,
-                CenterEdgePixels = template.CenterEdgePixels,
-                IsWhite = template.IsWhite
-            }).ToList());
+            pair => pair.Value.Select(ClonePieceTemplate).ToList());
+
+    private static Dictionary<char, List<PieceTemplate>> CloneSignatures(
+        Dictionary<char, List<PieceTemplate>> signatures) =>
+        signatures.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.Select(ClonePieceTemplate).ToList());
+
+    private static PieceTemplate ClonePieceTemplate(PieceTemplate template) => new()
+    {
+        EdgePatch = (double[])template.EdgePatch.Clone(),
+        BodyR = template.BodyR,
+        BodyG = template.BodyG,
+        BodyB = template.BodyB,
+        PieceLuma = template.PieceLuma,
+        RawContrast = template.RawContrast,
+        CenterEdgePixels = template.CenterEdgePixels,
+        IsWhite = template.IsWhite
+    };
 
     private static bool HasValidSignatures(Dictionary<char, List<PieceTemplate>> signatures)
     {
@@ -284,6 +338,17 @@ public sealed class TemplateRecognizer : ICalibratableRecognizer
 
     private void RecalculateBodyColors()
     {
+        (_whiteBodyR, _whiteBodyG, _whiteBodyB, _blackBodyR, _blackBodyG, _blackBodyB) = CalculateBodyColors(
+            _pieceSignatures,
+            _whiteBodyR, _whiteBodyG, _whiteBodyB,
+            _blackBodyR, _blackBodyG, _blackBodyB);
+    }
+
+    private static (double WhiteR, double WhiteG, double WhiteB, double BlackR, double BlackG, double BlackB) CalculateBodyColors(
+        Dictionary<char, List<PieceTemplate>> signatures,
+        double defaultWhiteR, double defaultWhiteG, double defaultWhiteB,
+        double defaultBlackR, double defaultBlackG, double defaultBlackB)
+    {
         var whiteRs = new List<double>();
         var whiteGs = new List<double>();
         var whiteBs = new List<double>();
@@ -291,7 +356,7 @@ public sealed class TemplateRecognizer : ICalibratableRecognizer
         var blackGs = new List<double>();
         var blackBs = new List<double>();
 
-        foreach (var pair in _pieceSignatures)
+        foreach (var pair in signatures)
         {
             bool isWhite = char.IsUpper(pair.Key);
             foreach (var template in pair.Value)
@@ -311,20 +376,25 @@ public sealed class TemplateRecognizer : ICalibratableRecognizer
             }
         }
 
+        double wR = defaultWhiteR, wG = defaultWhiteG, wB = defaultWhiteB;
+        double bR = defaultBlackR, bG = defaultBlackG, bB = defaultBlackB;
+
         if (whiteRs.Count > 0)
         {
             whiteRs.Sort(); whiteGs.Sort(); whiteBs.Sort();
-            _whiteBodyR = whiteRs[whiteRs.Count / 2];
-            _whiteBodyG = whiteGs[whiteGs.Count / 2];
-            _whiteBodyB = whiteBs[whiteBs.Count / 2];
+            wR = whiteRs[whiteRs.Count / 2];
+            wG = whiteGs[whiteGs.Count / 2];
+            wB = whiteBs[whiteBs.Count / 2];
         }
         if (blackRs.Count > 0)
         {
             blackRs.Sort(); blackGs.Sort(); blackBs.Sort();
-            _blackBodyR = blackRs[blackRs.Count / 2];
-            _blackBodyG = blackGs[blackGs.Count / 2];
-            _blackBodyB = blackBs[blackBs.Count / 2];
+            bR = blackRs[blackRs.Count / 2];
+            bG = blackGs[blackGs.Count / 2];
+            bB = blackBs[blackBs.Count / 2];
         }
+
+        return (wR, wG, wB, bR, bG, bB);
     }
 
     private static char ToFenPiece(PieceClass piece) => piece switch

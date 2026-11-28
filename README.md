@@ -9,8 +9,8 @@ ChGhost is a Windows x64 WPF educational chess overlay trainer for position anal
 - **Engine**: asynchronous Stockfish UCI in a Job Object, FEN boundary validation, and idle auto-unload.
 - **Overlay**: `PerMonitorV2` DPI, click-through layered window, `WDA_EXCLUDEFROMCAPTURE`, `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`, hidden from the taskbar.
 - **Analysis modes**:
-  - **Precision mode** (`MultiPV = 1` via `GetBestMoveAsync`, returning `PV #1`): active whenever `StealthHumanize` (`Alt+H`) or `HumanPacingEnabled` (`Alt+T`) is disabled, or `MultiPvCount <= 1`.
-  - **Advisor mode** (`StealthHumanize = true`, `HumanPacingEnabled = true`, `MultiPvCount > 1`): collects MultiPV lines, selects a candidate via `HumanMoveSelector` (`HumanMaxCpLoss` clamped to `0–300`), optionally renders alternative arrows, and applies a pre-hint thinking delay.
+  - **Precision mode** (`MultiPV = 1` via `GetBestMoveAsync`, returning `PV #1`): active when advisor mode (`Alt+H`, `StealthHumanize`) is off, or when both `ShowAdvisorArrows` and pre-hint delay (`Alt+T`, `HumanPacingEnabled`) are off, or `MultiPvCount <= 1`.
+  - **Advisor mode (`Alt+H`)**: works independently of the pre-hint delay (`Alt+T`). With `Alt+H` on and `Alt+T` off, the primary arrow is always `PV #1` with zero delay while alternative advisor arrows (`ShowAdvisorArrows`) continue to be displayed. With both `Alt+H` and `Alt+T` on, `HumanMoveSelector` selects within `HumanMaxCpLoss` (`0–300`) and applies the configured pre-hint delay.
 
 ## Hotkeys
 
@@ -22,7 +22,7 @@ ChGhost is a Windows x64 WPF educational chess overlay trainer for position anal
 | `Alt + 3` | Async smart start / full position rescan |
 | `Alt + S` | Start / pause continuous analysis |
 | `Alt + R` | Force immediate rescan and move calculation |
-| `Alt + H` | Toggle advisor mode (`StealthHumanize`) |
+| `Alt + H` | Toggle advisor mode (`StealthHumanize`, independent of `Alt + T`) |
 | `Alt + T` | Toggle pre-hint delay (`HumanPacingEnabled`) |
 | `Alt + D` | Toggle X-Ray piece labels overlay (off by default) |
 | `Alt + C` | Toggle side (White / Black) |

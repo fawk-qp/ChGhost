@@ -155,7 +155,7 @@ public class HumanMoveSelectorTests
     }
 
     [Fact]
-    public void Select_PacingDisabled_AlwaysReturnsBestMoveWithZeroDelayAndNoRandomness()
+    public void Select_PacingDisabled_WithAdvisorModeFalse_ReturnsBestMoveWithoutAlternatives()
     {
         var candidates = new[]
         {
@@ -170,7 +170,8 @@ public class HumanMoveSelectorTests
             AdvisorMaxArrows: 2,
             PacingEnabled: false,
             MinDelayMs: 200,
-            MaxDelayMs: 800);
+            MaxDelayMs: 800,
+            AdvisorMode: false);
 
         MoveRecommendation rec = HumanMoveSelector.Select(candidates, EmptyGrid(), options, new ThrowingRandom());
 
@@ -179,6 +180,38 @@ public class HumanMoveSelectorTests
         Assert.Equal(1, rec.PickIndex);
         Assert.Equal(0, rec.RecommendedDelayMs);
         Assert.Empty(rec.Alternatives);
+    }
+
+    [Fact]
+    public void Select_PacingDisabled_WithAdvisorModeTrue_ReturnsBestMoveAndPopulatesAlternatives()
+    {
+        var candidates = new[]
+        {
+            Cp("d2d4", 28, 2),
+            Cp("e2e4", 30, 1),
+            Cp("c2c4", 26, 3),
+            Cp("a2a3", -120, 4)
+        };
+        var options = new HumanizerOptions(
+            MaxCpLoss: 45,
+            AdvisorMaxGapCp: 65,
+            AdvisorMaxArrows: 2,
+            PacingEnabled: false,
+            MinDelayMs: 200,
+            MaxDelayMs: 800,
+            AdvisorMode: true);
+
+        MoveRecommendation rec = HumanMoveSelector.Select(candidates, EmptyGrid(), options, new ThrowingRandom());
+
+        Assert.Equal("e2e4", rec.Primary.Uci);
+        Assert.Equal(1, rec.Primary.MultiPvIndex);
+        Assert.Equal(1, rec.PickIndex);
+        Assert.Equal(0, rec.RecommendedDelayMs);
+        Assert.Equal(2, rec.Alternatives.Count);
+        Assert.Contains(rec.Alternatives, c => c.Uci == "d2d4");
+        Assert.Contains(rec.Alternatives, c => c.Uci == "c2c4");
+        Assert.DoesNotContain(rec.Alternatives, c => c.Uci == "e2e4");
+        Assert.DoesNotContain(rec.Alternatives, c => c.Uci == "a2a3");
     }
 
     private static CandidateMove Cp(string uci, int scoreCp, int multiPv)

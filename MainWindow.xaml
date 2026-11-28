@@ -22,7 +22,7 @@
                 <Border Height="1" Background="#33FFFFFF" Margin="0,2,0,6"/>
                 <TextBlock x:Name="HotkeysText" Foreground="#99AAB5"
                            FontFamily="Consolas" FontSize="11"
-                           Text="Alt+F автопоиск · Alt+1/2 углы · Alt+3 старт · Alt+S старт/пауза · Alt+R ход&#x0a;Alt+H советник · Alt+T пауза хода · Alt+D метки · Alt+Q выход"/>
+                           Text="Alt+F автопоиск · Alt+1/2 углы · Alt+3 старт · Alt+S старт/пауза · Alt+R ход&#x0a;Alt+H советник · Alt+T задержка · Alt+D метки · Alt+Q выход"/>
             </StackPanel>
         </Border>
     </Canvas>

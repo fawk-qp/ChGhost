@@ -28,7 +28,8 @@ public sealed record HumanizerOptions(
     int AdvisorMaxGapCp = 65,
     bool PacingEnabled = true,
     int MinDelayMs = 120,
-    int MaxDelayMs = 950);
+    int MaxDelayMs = 950,
+    bool AdvisorMode = true);
 
 public sealed record MoveRecommendation(
     CandidateMove Primary,
